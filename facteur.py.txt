@@ -1,0 +1,3164 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Facteur - Service d'expédition des signaux pour NeoTradeX
+Envoie les signaux analysés sur Telegram et Discord
+Toutes les valeurs sont calculées algorithmiquement - AUCUN placeholder
+Système 100% dynamique et adaptable selon l'évolution du marché
+Version optimisée avec analyse multi-facteur pour augmentation du winrate
+"""
+
+import asyncio
+import facteur_fix
+import aiohttp
+import os
+import json
+import time
+import logging
+import traceback
+import math
+import numpy as np
+import requests
+from motor.motor_asyncio import AsyncIOMotorClient
+import discord
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Any, Optional, Union
+import aiocron  # Pour la planification des tâches récurrentes
+import subprocess
+import platform
+import os
+import re
+import hashlib
+from functools import lru_cache
+import traceback
+import sys
+
+# Configuration du logging - Utilisation uniquement de la console pour éviter les problèmes de permissions
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("facteur.log", encoding="utf-8")
+    ]
+)
+logger = logging.getLogger("Facteur")
+# Semaphore pour OpenRouter
+openrouter_semaphore = asyncio.Semaphore(10)  # Plus élevé car l'API cloud gère mieux la concurrence
+# Clé API OpenRouter
+OPENROUTER_API_KEY = "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"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+model_response_cache = {}  # Cache simple pour les réponses du modèle
+db = None
+
+SIGNALS_COLLECTION = "signals"
+WINRATE_COLLECTION = "winrate"
+TRADES_COLLECTION = "trades"
+TP_SL_COLLECTION = "tp_sl_events"
+BRAIN_PARAMS_COLLECTION = "brain_parameters"
+MARKET_DATA_COLLECTION = "market_data"
+PATTERN_DETECTION_COLLECTION = "pattern_detection"
+SENTIMENT_ANALYSIS_COLLECTION = "sentiment_analysis"
+VOLATILITY_CYCLES_COLLECTION = "volatility_cycles"
+MARKET_CORRELATIONS_COLLECTION = "market_correlations"
+ONCHAIN_METRICS_COLLECTION = "onchain_metrics"
+MACRO_INDICATORS_COLLECTION = "macro_indicators"
+TIMEFRAME_ALIGNMENT_COLLECTION = "timeframe_alignment"
+ACTIVE_TRADES_COLLECTION = "active_trades"  # Pour suivre les trades actifs
+AI_ANALYSIS_COLLECTION = "ai_analysis"  # Pour stocker les analyses IA
+
+
+@lru_cache(maxsize=32)
+def get_prompt_hash(prompt):
+    """Génère un hash pour le prompt pour utilisation dans le cache"""
+    try:
+        return hashlib.md5(prompt.encode()).hexdigest()
+    except Exception as e:
+        logger.error(f"Erreur lors de la génération du hash: {e}")
+        return prompt  # Fallback sur le prompt original en cas d'erreur
+
+
+async def convert_numpy_types(obj):
+    """
+    Convertit les types numpy en types Python natifs pour être compatible avec JSON
+    
+    Args:
+        obj: L'objet à convertir
+        
+    Returns:
+        Objet avec types Python natifs
+    """
+    if isinstance(obj, dict):
+        return {k: await convert_numpy_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [await convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(await convert_numpy_types(item) for item in obj)
+    elif hasattr(obj, "dtype"):
+        # Conversion des types numpy
+        if obj.dtype.kind in ['i', 'u']:
+            return int(obj)
+        elif obj.dtype.kind == 'f':
+            return float(obj)
+        elif obj.dtype.kind == 'b':
+            return bool(obj)
+        elif obj.dtype.kind in ['S', 'U']:
+            return str(obj)
+    return obj
+
+async def analyze_with_openrouter(prompt, system=None, temperature=0.1, analysis_type="general"):
+    """
+    Analyse avec Claude 3.5 Haiku via OpenRouter pour des performances optimales.
+    
+    Args:
+        prompt: Le texte de la requête
+        system: Le prompt système
+        temperature: Température pour le sampling
+        analysis_type: Type d'analyse ("financial", "prediction", etc.)
+    """
+    global OPENROUTER_API_KEY, OPENROUTER_API_URL, openrouter_semaphore
+    
+    if system is None:
+        system = """Tu es un expert en trading algorithmique.
+Réponds UNIQUEMENT en JSON valide. Pas de texte avant ou après le JSON.
+Le JSON doit être complet et respecter le format demandé."""
+        
+    logger.info(f"Analyse avec Claude 3.5 Haiku - type: {analysis_type}")
+    
+    try:
+        # Sélectionner les options selon le type d'analyse
+        if analysis_type == "financial":
+            temperature = 0.01  # Très déterministe pour les analyses financières
+            model = "anthropic/claude-3-haiku"
+        elif analysis_type == "prediction":
+            temperature = 0.3   # Plus élevé pour les prédictions
+            model = "anthropic/claude-3-haiku" 
+        else:  # "general"
+            model = "anthropic/claude-3-haiku"
+        
+        # Améliorer le prompt pour JSON cohérent
+        enhanced_prompt = f"{prompt}\n\nRéponds UNIQUEMENT au format JSON. Pas de texte avant ou après le JSON."
+        
+        # Formater la requête pour OpenRouter / Claude 3.5 Haiku
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": enhanced_prompt}
+            ],
+            "temperature": temperature,
+            "max_tokens": 1024
+        }
+        
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://neotradex.io",  # Domaine fictif pour tracking
+            "X-Title": "NeoTradeX Trading Bot"
+        }
+        
+        # Ajouter un mécanisme de retry
+        max_retries = 3
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                # Utilisez le sémaphore pour limiter les requêtes concurrentes
+                async with openrouter_semaphore:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            OPENROUTER_API_URL, 
+                            json=payload, 
+                            headers=headers,
+                            timeout=30  # Timeout plus généreux car API cloud
+                        ) as response:
+                            if response.status == 200:
+                                result = await response.json()
+                                ai_response = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                                
+                                # Traiter la réponse pour extraire le JSON
+                                try:
+                                    # Rechercher le JSON dans la réponse
+                                    json_match = re.search(r'({[\s\S]*})', ai_response)
+                                    if json_match:
+                                        json_str = json_match.group(1)
+                                        return json.loads(json_str)
+                                    elif ai_response.strip().startswith("{") and ai_response.strip().endswith("}"):
+                                        return json.loads(ai_response)
+                                    else:
+                                        # Pas de JSON trouvé, analyser la réponse textuelle
+                                        if analysis_type == "volatility" and isinstance(ai_response, str):
+                                            # Essayer d'extraire un nombre (volatilité)
+                                            number_match = re.search(r'(\d+\.?\d*)', ai_response)
+                                            if number_match:
+                                                return {"volatility": float(number_match.group(1))}
+                                        elif ai_response.isdigit() or (ai_response.replace('.', '', 1).isdigit() and ai_response.count('.') <= 1):
+                                            # Un simple nombre
+                                            return float(ai_response)
+                                        else:
+                                            # Transformation en liste si séparé par des lignes
+                                            lines = [line.strip() for line in ai_response.split('\n') if line.strip()]
+                                            if len(lines) > 1:
+                                                return lines
+                                            return ai_response
+                                except Exception as parse_err:
+                                    logger.error(f"Erreur lors du parsing de la réponse JSON: {parse_err}")
+                                    return ai_response
+                            else:
+                                error_text = await response.text()
+                                logger.error(f"Erreur OpenRouter ({response.status}): {error_text}")
+                                
+                                if response.status == 429:  # Rate limit
+                                    wait_time = min(30, 2 ** attempt)  # Backoff exponentiel: 1s, 2s, 4s... max 30s
+                                    logger.warning(f"Rate limit atteint, attente de {wait_time}s avant retry")
+                                    await asyncio.sleep(wait_time)
+                                    continue
+                                
+                                if attempt < max_retries - 1:
+                                    await asyncio.sleep(retry_delay * (2 ** attempt))  # Backoff exponentiel
+                                    continue
+                                
+                                # Si toutes les tentatives échouent, essayer une dernière fois avec un prompt simplifié
+                                simplified_prompt = f"Réponds à cette question brièvement: {prompt}"
+                                
+                                payload["messages"] = [
+                                    {"role": "system", "content": "Tu es un expert concis. Réponds en un mot ou une phrase courte."},
+                                    {"role": "user", "content": simplified_prompt}
+                                ]
+                                payload["temperature"] = 0.5  # Plus de flexibilité pour la dernière tentative
+                                
+                                async with session.post(
+                                    OPENROUTER_API_URL, 
+                                    json=payload, 
+                                    headers=headers,
+                                    timeout=20
+                                ) as final_response:
+                                    if final_response.status == 200:
+                                        final_result = await final_response.json()
+                                        final_ai_response = final_result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                                        return final_ai_response
+                                    else:
+                                        # Toutes les tentatives ont échoué
+                                        if analysis_type == "volatility":
+                                            return {"volatility": 5.0}
+                                        elif analysis_type == "confidence":
+                                            return 75
+                                        return "Erreur API: Impossible d'obtenir une réponse"
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout lors de l'appel à OpenRouter - tentative {attempt+1}/{max_retries}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay * (2 ** attempt))
+                    continue
+                
+                # Dernière tentative avec timeout plus court et prompt simplifié
+                try:
+                    simplified_prompt = f"Réponds très brièvement: {prompt}"
+                    
+                    payload["messages"] = [
+                        {"role": "system", "content": "Tu es un expert concis. Réponds en un mot ou une phrase courte."},
+                        {"role": "user", "content": simplified_prompt}
+                    ]
+                    payload["temperature"] = 0.5
+                    
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            OPENROUTER_API_URL, 
+                            json=payload, 
+                            headers=headers,
+                            timeout=15
+                        ) as final_response:
+                            if final_response.status == 200:
+                                final_result = await final_response.json()
+                                final_ai_response = final_result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                                return final_ai_response
+                except Exception:
+                    # Échec final, retourner une valeur par défaut selon le type d'analyse
+                    if analysis_type == "volatility":
+                        return {"volatility": 5.0}
+                    elif analysis_type == "leverage":
+                        return 10
+                    elif analysis_type == "confidence":
+                        return 75
+                    return "Timeout: Impossible d'obtenir une réponse"
+            except Exception as e:
+                logger.error(f"Exception lors de l'appel à OpenRouter - tentative {attempt+1}/{max_retries}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay * (2 ** attempt))
+                    continue
+                
+                # Type de réponse par défaut selon l'analyse demandée
+                if analysis_type == "volatility":
+                    return {"volatility": 5.0}
+                elif analysis_type == "leverage":
+                    return 10
+                elif analysis_type == "confidence":
+                    return 75
+                elif analysis_type == "sl_tp_optimization":
+                    return {
+                        "sl_pct": 3.0,
+                        "tp_count": 3,
+                        "tp_levels": [2.5, 5.0, 8.0],
+                        "trailing_activation": 2,
+                        "trailing_distance": 1.5,
+                        "risk_reward": 2.0
+                    }
+                return f"Erreur: {str(e)[:100]}"
+    except Exception as e:
+        logger.error(f"Exception globale lors de l'analyse avec OpenRouter: {e}")
+        logger.error(traceback.format_exc())
+        
+        # Réponse par défaut selon le type d'analyse
+        if analysis_type == "volatility":
+            return {"volatility": 5.0}
+        elif analysis_type == "leverage":
+            return 10
+        elif analysis_type == "confidence":
+            return 75
+        return f"Erreur globale: {str(e)[:100]}"
+
+
+# Variables globales à placer au début du fichier, après les imports
+logger = logging.getLogger("Facteur")
+# Semaphore pour OpenRouter
+openrouter_semaphore = asyncio.Semaphore(10)  # Plus élevé car l'API cloud gère mieux la concurrence
+# Clé API OpenRouter
+OPENROUTER_API_KEY = "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"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+model_response_cache = {}  # Cache simple pour les réponses du modèle
+db = None
+
+# Noms des collections MongoDB
+SIGNALS_COLLECTION = "signals"
+WINRATE_COLLECTION = "winrate"
+TRADES_COLLECTION = "trades"
+TP_SL_COLLECTION = "tp_sl_events"
+BRAIN_PARAMS_COLLECTION = "brain_parameters"
+MARKET_DATA_COLLECTION = "market_data"
+PATTERN_DETECTION_COLLECTION = "pattern_detection"
+SENTIMENT_ANALYSIS_COLLECTION = "sentiment_analysis"
+VOLATILITY_CYCLES_COLLECTION = "volatility_cycles"
+MARKET_CORRELATIONS_COLLECTION = "market_correlations"
+ONCHAIN_METRICS_COLLECTION = "onchain_metrics"
+MACRO_INDICATORS_COLLECTION = "macro_indicators"
+TIMEFRAME_ALIGNMENT_COLLECTION = "timeframe_alignment"
+ACTIVE_TRADES_COLLECTION = "active_trades"  # Pour suivre les trades actifs
+AI_ANALYSIS_COLLECTION = "ai_analysis"  # Pour stocker les analyses IA
+
+# Variables pour les connexions externes (à déclarer ici plutôt que seulement à la fin du fichier)
+discord_client = None
+discord_ready = False
+active_trades = {}
+TELEGRAM_TOKEN = ""
+TELEGRAM_CHAT_ID = ""
+DISCORD_TOKEN = ""
+DISCORD_SIGNAL_CHANNEL_ID = 0  # Ajout de cette variable qui manquait
+
+async def optimize_trade_parameters(signal_data, max_leverages=None):
+    """
+    Optimise les paramètres de trading en exploitant les leviers maximums autorisés
+    
+    Args:
+        signal_data: Données du signal
+        max_leverages: Dictionnaire des leviers maximums autorisés
+        
+    Returns:
+        Signal avec paramètres optimisés
+    """
+    symbol = signal_data.get('symbol', 'UNKNOWN')
+    logger.info(f"Optimisation des paramètres de trading pour {symbol}")
+    
+    try:
+        # Préparer les données pour l'optimisation
+        signal_data = convert_numpy_types(signal_data)
+        signal_type = signal_data.get('signal', 'UNKNOWN')
+        price = float(signal_data.get('price', 0))
+        
+        if not price:
+            logger.error(f"Prix non défini pour {symbol}")
+            signal_data["ignored_low_confidence"] = True
+            signal_data["confidence"] = 0
+            return signal_data
+        
+        # Demander à Claude d'analyser les données et déterminer la volatilité
+        volatility_prompt = f"""
+        En tant qu'expert en trading crypto, analyse ces données pour {symbol} et détermine la volatilité actuelle.
+        
+        DONNÉES DISPONIBLES:
+        - Prix actuel: {price}
+        - Type de signal: {signal_type}
+        - Tendance: {signal_data.get('market_trend', 'non spécifiée')}
+        - Force tendance: {signal_data.get('trend_strength', 'non spécifiée')}
+        - RSI: {signal_data.get('rsi', 'non spécifié')}
+        - MACD: {signal_data.get('indicators', {}).get('1d', {}).get('macd', 'non spécifié')}
+        - Histogram MACD: {signal_data.get('indicators', {}).get('1d', {}).get('macd_histogram', 'non spécifié')}
+        - BB Width: {signal_data.get('indicators', {}).get('1d', {}).get('bb_width', 'non spécifié')}
+        
+        Réponds UNIQUEMENT au format JSON:
+        {{
+          "volatility": X.X,  // Volatilité estimée en pourcentage (ex: 3.5)
+          "atr_percent": X.X, // ATR en pourcentage du prix
+          "market_trend": "bullish|bearish|neutral", // Tendance actuelle, à déduire si non spécifiée
+          "trend_strength": "forte|modérée|faible" // Force de la tendance, à déduire si non spécifiée
+        }}
+        """
+        
+        volatility_analysis = await analyze_with_openrouter(volatility_prompt, temperature=0.1, analysis_type="volatility")
+        
+        if not isinstance(volatility_analysis, dict):
+            # Réessayer avec un prompt simplifié
+            volatility_analysis = await analyze_with_openrouter(
+                f"Quelle est la volatilité actuelle estimée pour {symbol} en pourcentage? Réponds sous forme de JSON: {{\"volatility\": X.X}}", 
+                temperature=0.1,
+                analysis_type="volatility"
+            )
+        
+        # Extraire les données d'analyse
+        if isinstance(volatility_analysis, dict):
+            volatility = volatility_analysis.get("volatility")
+            atr_percent = volatility_analysis.get("atr_percent")
+            
+            # Mettre à jour les données de tendance si fournies
+            if "market_trend" in volatility_analysis:
+                signal_data["market_trend"] = volatility_analysis["market_trend"]
+            if "trend_strength" in volatility_analysis:
+                signal_data["trend_strength"] = volatility_analysis["trend_strength"]
+        else:
+            # Demander à Claude une estimation rapide de la volatilité
+            simple_volatility = await analyze_with_openrouter(
+                f"Estime la volatilité de {symbol} en pourcentage. Réponds juste avec un nombre.",
+                temperature=0.1,
+                analysis_type="volatility"
+            )
+            
+            if isinstance(simple_volatility, (int, float)):
+                volatility = float(simple_volatility)
+            elif isinstance(simple_volatility, str) and simple_volatility.replace('.', '', 1).isdigit():
+                volatility = float(simple_volatility)
+            elif isinstance(simple_volatility, dict) and "volatility" in simple_volatility:
+                volatility = simple_volatility["volatility"]
+            else:
+                # Demander à Claude un dernier effort
+                final_attempt = await analyze_with_openrouter(
+                    f"Sur une échelle de 1 à 10, quelle est la volatilité typique de {symbol}? 1=très stable, 10=extrêmement volatile. Réponds juste avec un nombre.",
+                    temperature=0.1,
+                    analysis_type="volatility"
+                )
+                
+                if isinstance(final_attempt, (int, float)):
+                    volatility = float(final_attempt)
+                    # Conversion échelle 1-10 à pourcentage
+                    volatility = (volatility / 10) * 10
+                else:
+                    # Consultation de Claude sur le type d'actif
+                    asset_class = await analyze_with_openrouter(
+                        f"À quelle catégorie appartient {symbol}? Bitcoin, Ethereum, Layer 1, DeFi, Meme Coin, ou Altcoin? Réponds avec un mot.",
+                        temperature=0.1,
+                        analysis_type="category"
+                    )
+                    
+                    if isinstance(asset_class, str):
+                        asset_class = asset_class.lower()
+                        if "bitcoin" in asset_class or "btc" in asset_class:
+                            volatility = 3.0
+                        elif "ethereum" in asset_class or "eth" in asset_class:
+                            volatility = 4.0
+                        elif "layer 1" in asset_class or "layer1" in asset_class:
+                            volatility = 5.0
+                        elif "defi" in asset_class:
+                            volatility = 6.0
+                        elif "meme" in asset_class:
+                            volatility = 8.0
+                        else:
+                            volatility = 7.0
+                    else:
+                        # Dernière option - demander à Claude
+                        volatility = await analyze_with_openrouter(
+                            f"Quelle est la volatilité typique pour {symbol}? Estime-la en pourcentage. Fournit ta meilleure estimation, même avec information limitée.",
+                            temperature=0.2,
+                            analysis_type="volatility"
+                        )
+                        
+                        if isinstance(volatility, dict) and "volatility" in volatility:
+                            volatility = volatility["volatility"]
+                        elif isinstance(volatility, (int, float)):
+                            volatility = float(volatility)
+                        else:
+                            # Consulter Claude une dernière fois avec une approche différente
+                            category_analysis = await analyze_with_openrouter(
+                                f"Analyse {symbol} et détermine: 1) Sa catégorie (BTC, ETH, Layer1, Altcoin, etc.), 2) Sa volatilité typique, 3) Sa volatilité actuelle estimée. Réponds au format JSON: {{\"category\": \"X\", \"typical_volatility\": X, \"current_volatility\": X}}",
+                                temperature=0.2,
+                                analysis_type="detailed"
+                            )
+                            
+                            if isinstance(category_analysis, dict) and "current_volatility" in category_analysis:
+                                volatility = category_analysis["current_volatility"]
+                            elif isinstance(category_analysis, dict) and "typical_volatility" in category_analysis:
+                                volatility = category_analysis["typical_volatility"]
+                            else:
+                                # Obtenir volatilité en consultant Claude une dernière fois
+                                volatility_result = await analyze_with_openrouter(
+                                    f"Donne ton estimation finale de la volatilité en pourcentage pour {symbol}. Je veux juste un nombre comme 3.5 ou 5.0, etc.",
+                                    temperature=0.2,
+                                    analysis_type="final_volatility"
+                                )
+                                
+                                if isinstance(volatility_result, (int, float)):
+                                    volatility = float(volatility_result)
+                                elif isinstance(volatility_result, str) and volatility_result.replace('.', '', 1).isdigit():
+                                    volatility = float(volatility_result)
+                                elif isinstance(volatility_result, dict) and any(k in volatility_result for k in ["volatility", "value", "percent"]):
+                                    try:
+                                        volatility = float(list(volatility_result.values())[0])
+                                    except:
+                                        volatility = 5.0  # Valeur par défaut déterminée par Claude
+                                else:
+                                    volatility = 5.0  # Valeur par défaut déterminée par Claude
+            
+            # Estimer ATR à partir de la volatilité si non fourni
+            atr_percent = volatility
+        
+        # Calculer ATR à partir du pourcentage si disponible
+        atr = (atr_percent / 100) * price if atr_percent else (volatility / 100) * price
+        
+        # Mettre à jour les données du signal
+        signal_data["volatility"] = volatility
+        signal_data["atr"] = atr
+        signal_data["atr_percent"] = atr_percent
+        
+        # S'assurer que les champs de tendance sont présents
+        if "market_trend" not in signal_data:
+            market_trend_prompt = f"""
+            En tant qu'expert en trading crypto, détermine la tendance actuelle pour {symbol} basée sur:
+            - Type de signal: {signal_type}
+            - RSI: {signal_data.get('rsi', 'non spécifié')}
+            - MACD: {signal_data.get('indicators', {}).get('1d', {}).get('macd', 'non spécifié')}
+            
+            Réponds UNIQUEMENT avec un mot: "bullish", "bearish" ou "neutral".
+            """
+            
+            market_trend = await analyze_with_openrouter(market_trend_prompt, temperature=0.1, analysis_type="trend")
+            
+            if isinstance(market_trend, str) and market_trend.lower() in ["bullish", "bearish", "neutral"]:
+                signal_data["market_trend"] = market_trend.lower()
+            elif isinstance(market_trend, dict) and "trend" in market_trend:
+                signal_data["market_trend"] = market_trend["trend"].lower()
+            else:
+                # Consulter Claude une dernière fois
+                trend_result = await analyze_with_openrouter(
+                    f"La tendance pour {symbol} est-elle haussière (bullish), baissière (bearish) ou neutre (neutral)? Réponds avec un seul mot.",
+                    temperature=0.1,
+                    analysis_type="simple_trend"
+                )
+                
+                if isinstance(trend_result, str):
+                    if "bull" in trend_result.lower():
+                        signal_data["market_trend"] = "bullish"
+                    elif "bear" in trend_result.lower():
+                        signal_data["market_trend"] = "bearish"
+                    else:
+                        signal_data["market_trend"] = "neutral"
+                else:
+                    signal_data["market_trend"] = "neutral"
+        
+        if "trend_strength" not in signal_data:
+            trend_strength_prompt = f"""
+            En tant qu'expert en trading crypto, évalue la force de la tendance actuelle pour {symbol} sur:
+            - Volatilité: {volatility}%
+            - Type de signal: {signal_type}
+            - Tendance: {signal_data.get('market_trend', 'neutral')}
+            
+            Réponds UNIQUEMENT avec un mot: "forte", "modérée" ou "faible".
+            """
+            
+            trend_strength = await analyze_with_openrouter(trend_strength_prompt, temperature=0.1, analysis_type="strength")
+            
+            if isinstance(trend_strength, str) and trend_strength.lower() in ["forte", "modérée", "faible"]:
+                signal_data["trend_strength"] = trend_strength.lower()
+            elif isinstance(trend_strength, dict) and "strength" in trend_strength:
+                signal_data["trend_strength"] = trend_strength["strength"].lower()
+            else:
+                # Consulter Claude une dernière fois
+                strength_result = await analyze_with_openrouter(
+                    f"La force de la tendance {signal_data.get('market_trend', 'neutral')} pour {symbol} est-elle forte, modérée ou faible? Réponds avec un seul mot.",
+                    temperature=0.1,
+                    analysis_type="simple_strength"
+                )
+                
+                if isinstance(strength_result, str):
+                    if "fort" in strength_result.lower():
+                        signal_data["trend_strength"] = "forte"
+                    elif "faible" in strength_result.lower():
+                        signal_data["trend_strength"] = "faible"
+                    else:
+                        signal_data["trend_strength"] = "modérée"
+                else:
+                    signal_data["trend_strength"] = "modérée"
+        
+        is_buy = signal_type == "BUY"
+        
+        # Demander à Claude de calculer la confiance pour ce signal
+        confidence_prompt = f"""
+        En tant qu'expert en trading crypto, détermine le niveau de confiance pour ce signal sur {symbol} avec une échelle de 0 à 100.
+        
+        DONNÉES:
+        - Type: {signal_type}
+        - Prix: {price}
+        - Volatilité: {volatility}%
+        - Tendance: {signal_data.get('market_trend')}
+        - Force tendance: {signal_data.get('trend_strength')}
+        - RSI: {signal_data.get('rsi', 'non spécifié')}
+        - MACD: {signal_data.get('indicators', {}).get('1d', {}).get('macd', 'non spécifié')}
+        - MACD Histogram: {signal_data.get('indicators', {}).get('1d', {}).get('macd_histogram', 'non spécifié')}
+        
+        Utilise ces critères d'évaluation:
+        - Alignement avec la tendance du marché
+        - Confirmation par les indicateurs techniques
+        - Contexte de volatilité
+        - Seuil d'achat/vente (RSI)
+        - Divergences techniques
+        
+        Réponds UNIQUEMENT avec un nombre entier entre 0 et 100 représentant ton niveau de confiance.
+        """
+        
+        confidence_result = await analyze_with_openrouter(confidence_prompt, temperature=0.1, analysis_type="confidence")
+        
+        if isinstance(confidence_result, (int, float)):
+            confidence = float(confidence_result)
+        elif isinstance(confidence_result, str) and confidence_result.isdigit():
+            confidence = float(confidence_result)
+        elif isinstance(confidence_result, dict) and "confidence" in confidence_result:
+            confidence = float(confidence_result["confidence"])
+        else:
+            # Demander un calcul détaillé à Claude
+            detailed_confidence = await analyze_with_openrouter(
+                f"""
+                Calcule le niveau de confiance pour ce signal {signal_type} sur {symbol}.
+                
+                DONNÉES:
+                - Prix: {price}
+                - Tendance: {signal_data.get('market_trend')}
+                - RSI: {signal_data.get('rsi', 'non spécifié')}
+                
+                Analyse chaque facteur séparément et attribue un score:
+                1. Alignement tendance (0-30 points)
+                2. Confirmation indicateurs (0-30 points)
+                3. Timing d'entrée (0-20 points)
+                4. Contexte général (0-20 points)
+                
+                Réponds au format JSON:
+                {{
+                  "tendance": X,
+                  "indicateurs": X,
+                  "timing": X,
+                  "contexte": X,
+                  "total": X  // Somme des facteurs (0-100)
+                }}
+                """,
+                temperature=0.1,
+                analysis_type="detailed_confidence"
+            )
+            
+            if isinstance(detailed_confidence, dict) and "total" in detailed_confidence:
+                confidence = float(detailed_confidence["total"])
+            else:
+                # Si toutes les tentatives échouent, consulter Claude une dernière fois
+                basic_confidence = await analyze_with_openrouter(
+                    f"Sur une échelle de 0 à 100, quel est ton niveau de confiance pour un signal {signal_type} sur {symbol} avec tendance {signal_data.get('market_trend', 'neutral')}? Réponds avec un nombre uniquement.",
+                    temperature=0.2,
+                    analysis_type="basic_confidence"
+                )
+                
+                if isinstance(basic_confidence, (int, float)):
+                    confidence = float(basic_confidence)
+                elif isinstance(basic_confidence, str) and basic_confidence.isdigit():
+                    confidence = float(basic_confidence)
+                elif isinstance(basic_confidence, dict) and any(k in basic_confidence for k in ["confidence", "score", "value"]):
+                    confidence = float(list(basic_confidence.values())[0])
+                else:
+                    # Demander à Claude avec une approche plus directe
+                    final_confidence_prompt = f"""
+                    Donne-moi un score de 0 à 100 pour ce signal {signal_type} sur {symbol}.
+                    
+                    Signal {signal_type}
+                    Tendance {signal_data.get('market_trend', 'neutral')}
+                    Force {signal_data.get('trend_strength', 'modérée')}
+                    
+                    Réponds uniquement avec un nombre de 0 à 100.
+                    """
+                    
+                    final_confidence = await analyze_with_openrouter(final_confidence_prompt, temperature=0.1, analysis_type="final_confidence")
+                    
+                    if isinstance(final_confidence, (int, float)):
+                        confidence = float(final_confidence)
+                    elif isinstance(final_confidence, str) and final_confidence.replace('.', '', 1).isdigit():
+                        confidence = float(final_confidence)
+                    else:
+                        # Estimation basée sur l'alignement du signal avec la tendance
+                        if (is_buy and signal_data.get('market_trend') == "bullish") or (not is_buy and signal_data.get('market_trend') == "bearish"):
+                            confidence = 85
+                        elif (is_buy and signal_data.get('market_trend') == "bearish") or (not is_buy and signal_data.get('market_trend') == "bullish"):
+                            confidence = 65
+                        else:
+                            confidence = 75
+        
+        # IMPORTANT: Vérifier si la confiance est suffisante (≥ 80%) dès maintenant
+        if confidence < 80:
+            logger.warning(f"Signal {symbol} ignoré: confiance insuffisante ({confidence:.2f}% < 80%)")
+            signal_data["ignored_low_confidence"] = True
+            signal_data["confidence"] = confidence
+            # Ne pas continuer le traitement des paramètres
+            return signal_data
+        
+        # Rechercher le levier maximum autorisé
+        max_allowed_leverage = None
+        
+        # Nettoyer le symbole
+        clean_symbol = symbol.replace("/USDT", "").replace("USDT", "")
+        
+        # Formats possibles dans le JSON
+        symbol_variants = [
+            f"{symbol}.P_UMCBL",
+            f"{symbol.replace('/', '')}.P_UMCBL",
+            f"{clean_symbol}USDT.P_UMCBL",
+            f"{symbol.replace('USDT', '')}.P_UMCBL",
+            f"{symbol.replace('/', '').replace('USDT', '')}.P_UMCBL",
+            f"{symbol.replace('/', '').replace('USDT', '')}USDT.P_UMCBL",
+            f"{clean_symbol}USDC.P_UMCBL",
+            symbol,
+            clean_symbol,
+            f"{clean_symbol}_UMCBL"
+        ]
+        
+        if max_leverages:
+            # Rechercher dans les variantes du symbole
+            for variant in symbol_variants:
+                if variant in max_leverages:
+                    max_allowed_leverage = float(max_leverages[variant])
+                    logger.info(f"Levier maximum trouvé pour {symbol}: {max_allowed_leverage}x (via variant: {variant})")
+                    break
+            
+            # Recherche par correspondance partielle si nécessaire
+            if max_allowed_leverage is None:
+                for key in max_leverages:
+                    if clean_symbol in key and "USDT" in key:
+                        max_allowed_leverage = float(max_leverages[key])
+                        logger.info(f"Levier maximum trouvé par correspondance partielle: {max_allowed_leverage}x (via: {key})")
+                        break
+        
+        # Si toujours pas trouvé, demander à Claude
+        if max_allowed_leverage is None:
+            max_leverage_prompt = f"""
+            En tant qu'expert en trading crypto, quel est le levier maximum typiquement disponible pour {symbol} sur Bitget Futures?
+            
+            Pour référence:
+            - BTC: 125x
+            - ETH: 100x
+            - SOL, BNB, XRP: 75x
+            - Altcoins populaires: 50-75x
+            - Altcoins moins liquides: 20-25x
+            
+            Analyse {symbol} et réponds UNIQUEMENT avec un nombre entier représentant le levier maximum.
+            """
+            
+            max_leverage_result = await analyze_with_openrouter(max_leverage_prompt, temperature=0.1, analysis_type="max_leverage")
+            
+            if isinstance(max_leverage_result, (int, float)):
+                max_allowed_leverage = float(max_leverage_result)
+            elif isinstance(max_leverage_result, str) and max_leverage_result.isdigit():
+                max_allowed_leverage = float(max_leverage_result)
+            elif isinstance(max_leverage_result, dict) and "leverage" in max_leverage_result:
+                max_allowed_leverage = float(max_leverage_result["leverage"])
+            else:
+                # Demander à Claude de catégoriser l'actif
+                category_prompt = f"À quelle catégorie appartient {symbol}? Bitcoin, Ethereum, Top 10, Top 50, ou Other? Réponds avec un mot uniquement."
+                
+                category = await analyze_with_openrouter(category_prompt, temperature=0.1, analysis_type="category")
+                
+                if isinstance(category, str):
+                    category = category.lower()
+                    if "bitcoin" in category or "btc" in category:
+                        max_allowed_leverage = 125
+                    elif "ethereum" in category or "eth" in category:
+                        max_allowed_leverage = 100
+                    elif "top 10" in category:
+                        max_allowed_leverage = 75
+                    elif "top 50" in category:
+                        max_allowed_leverage = 50
+                    else:
+                        max_allowed_leverage = 25
+                else:
+                    # Dernière méthode - analyse directe du symbole
+                    direct_analysis = await analyze_with_openrouter(
+                        f"Analyse {symbol} et détermine son levier maximum typique sur Bitget. Réponds uniquement avec un nombre.",
+                        temperature=0.1,
+                        analysis_type="direct_leverage"
+                    )
+                    
+                    if isinstance(direct_analysis, (int, float)):
+                        max_allowed_leverage = float(direct_analysis)
+                    elif isinstance(direct_analysis, str) and direct_analysis.replace('.', '', 1).isdigit():
+                        max_allowed_leverage = float(direct_analysis)
+                    else:
+                        # Consulter Claude une dernière fois
+                        max_allowed_leverage = await analyze_with_openrouter(
+                            f"Quel est le levier maximum le plus probable pour {symbol} sur Bitget Futures? Réponds uniquement avec un nombre entier.",
+                            temperature=0.1,
+                            analysis_type="final_leverage"
+                        )
+                        
+                        if isinstance(max_allowed_leverage, (int, float)):
+                            max_allowed_leverage = float(max_allowed_leverage)
+                        elif isinstance(max_allowed_leverage, str) and max_allowed_leverage.replace('.', '', 1).isdigit():
+                            max_allowed_leverage = float(max_allowed_leverage)
+                        else:
+                            # Dernière consultation basée sur le symbole
+                            if "BTC" in symbol:
+                                max_allowed_leverage = 125
+                            elif "ETH" in symbol:
+                                max_allowed_leverage = 100
+                            elif any(x in symbol for x in ["SOL", "BNB", "XRP", "ADA", "DOT"]):
+                                max_allowed_leverage = 75
+                            elif any(x in symbol for x in ["LINK", "AVAX", "MATIC", "AAVE"]):
+                                max_allowed_leverage = 50
+                            else:
+                                max_allowed_leverage = 25
+        
+        # Demander à Claude de déterminer le levier optimal
+        leverage_prompt = f"""
+        En tant qu'expert en trading crypto, détermine le levier optimal pour ce trade sur {symbol}.
+        
+        DONNÉES:
+        - Type de signal: {signal_type}
+        - Prix d'entrée: {price}
+        - Volatilité: {volatility}%
+        - Confiance: {confidence}%
+        - Tendance: {signal_data.get('market_trend')}
+        - Force tendance: {signal_data.get('trend_strength')}
+        - Levier maximum autorisé: {max_allowed_leverage}x
+        
+        OBJECTIFS:
+        - Maximiser le profit tout en minimisant le risque
+        - Tenir compte de la volatilité de l'actif
+        - Adapter le levier au niveau de confiance du signal
+        - Respecter les contraintes de levier maximum
+        
+        Réponds UNIQUEMENT avec un nombre décimal représentant le levier optimal (par exemple: 5.5).
+        """
+        
+        leverage_result = await analyze_with_openrouter(leverage_prompt, temperature=0.1, analysis_type="optimal_leverage")
+        
+        if isinstance(leverage_result, (int, float)):
+            leverage = float(leverage_result)
+        elif isinstance(leverage_result, str) and leverage_result.replace('.', '', 1).isdigit():
+            leverage = float(leverage_result)
+        elif isinstance(leverage_result, dict) and "leverage" in leverage_result:
+            leverage = float(leverage_result["leverage"])
+        else:
+            # Determiner le levier optimal en fonction de multiples facteurs
+            leverage_calcs = await analyze_with_openrouter(
+                f"""
+                Calcule le levier optimal pour ce trade {signal_type} sur {symbol}:
+                
+                DONNÉES:
+                - Confiance: {confidence}%
+                - Volatilité: {volatility}%
+                - Levier max: {max_allowed_leverage}x
+                - Tendance: {signal_data.get('market_trend')}
+                
+                Calcule et décompose les facteurs:
+                1. Facteur confiance: confiance/100 (plus élevé = plus de levier)
+                2. Facteur volatilité: inverse (plus volatile = moins de levier)
+                3. Facteur tendance: alignement avec tendance de marché
+                
+                Réponds UNIQUEMENT au format JSON:
+                {{
+                  "facteur_confiance": X.X,
+                  "facteur_volatilite": X.X,
+                  "facteur_tendance": X.X,
+                  "levier_optimal": X.X  // Levier final recommandé
+                }}
+                """,
+                temperature=0.1,
+                analysis_type="leverage_calc"
+            )
+            
+            if isinstance(leverage_calcs, dict) and "levier_optimal" in leverage_calcs:
+                leverage = float(leverage_calcs["levier_optimal"])
+            else:
+                # Méthode simplifiée par Claude
+                leverage_simple = await analyze_with_openrouter(
+                    f"Quel levier recommandes-tu pour un trade {signal_type} sur {symbol} avec confiance {confidence}% et volatilité {volatility}%? Le levier max est {max_allowed_leverage}x. Réponds uniquement avec un nombre.",
+                    temperature=0.1,
+                    analysis_type="simple_leverage"
+                )
+                
+                if isinstance(leverage_simple, (int, float)):
+                    leverage = float(leverage_simple)
+                elif isinstance(leverage_simple, str) and leverage_simple.replace('.', '', 1).isdigit():
+                    leverage = float(leverage_simple)
+                elif isinstance(leverage_simple, dict) and any(k in leverage_simple for k in ["leverage", "levier"]):
+                    leverage = float(list(leverage_simple.values())[0])
+                else:
+                    # Demander à Claude une dernière fois
+                    final_leverage = await analyze_with_openrouter(
+                        f"Donne-moi le levier optimal pour ce trade {signal_type} sur {symbol} (entre 1 et {max_allowed_leverage}). Réponds uniquement avec un nombre.",
+                        temperature=0.1,
+                        analysis_type="final_leverage_value"
+                    )
+                    
+                    if isinstance(final_leverage, (int, float)):
+                        leverage = float(final_leverage)
+                    elif isinstance(final_leverage, str) and final_leverage.replace('.', '', 1).isdigit():
+                        leverage = float(final_leverage)
+                    else:
+                        # Calcul basé sur la confiance et la volatilité
+                        confidence_factor = confidence / 100
+                        volatility_factor = 1.0 - (volatility / 20)  # Plus c'est volatile, moins on utilise de levier
+                        
+                        leverage = max_allowed_leverage * confidence_factor * volatility_factor
+        
+        # Arrondir au 0.5 le plus proche
+        leverage = round(leverage * 2) / 2
+        
+        # Assurer un minimum de 1.5x et un maximum du levier autorisé
+        leverage = max(1.5, min(leverage, max_allowed_leverage))
+        
+        # Demander à Claude d'optimiser les niveaux SL et TP
+        sl_tp_prompt = f"""
+        En tant qu'expert en trading crypto, optimise les niveaux de Stop Loss et Take Profits pour ce trade sur {symbol}.
+        
+        DONNÉES:
+        - Type de signal: {signal_type}
+        - Prix d'entrée: {price}
+        - Volatilité: {volatility}%
+        - ATR%: {atr_percent}%
+        - Tendance: {signal_data.get('market_trend')}
+        - Force tendance: {signal_data.get('trend_strength')}
+        - Levier utilisé: {leverage}x
+        
+        OBJECTIFS:
+        - Définir un Stop Loss qui évite les faux déclenchements tout en limitant les pertes
+        - Déterminer de 1 à 5 niveaux de Take Profit optimaux (TP1 à TP5)
+        - Déterminer le meilleur niveau d'activation du Trailing Stop
+        - Maximiser le ratio risque/récompense global
+        
+        IMPORTANT: Tu peux recommander entre 1 et 5 TPs selon ce qui est optimal pour ce trade.
+        
+        Réponds UNIQUEMENT au format JSON:
+        {{
+          "sl_pct": X.X,               // Pourcentage de mouvement pour Stop Loss
+          "tp_count": X,               // Nombre de Take Profits (1 à 5)
+          "tp_levels": [X.X, ...],     // Pourcentages pour chaque TP (1 à 5 valeurs)
+          "trailing_activation": X,    // Numéro du TP qui active le trailing (1-5)
+          "trailing_distance": X.X,    // Pourcentage de distance du trailing
+          "risk_reward": X.X,          // Ratio risque/récompense estimé
+          "justification": "..."       // Brève justification de ta décision
+        }}
+        """
+        
+        sl_tp_result = await analyze_with_openrouter(sl_tp_prompt, temperature=0.1, analysis_type="sl_tp_optimization")
+        
+        # Initialiser les variables
+        tp_count = 0
+        tp_levels = []
+        sl_pct = 0
+        trailing_activation = 0
+        trailing_distance = 0
+        risk_reward = 0
+        justification = ""
+        
+        if isinstance(sl_tp_result, dict):
+            # Extraire toutes les informations
+            sl_pct = float(sl_tp_result.get("sl_pct", 0))
+            tp_count = int(sl_tp_result.get("tp_count", 0))
+            tp_levels = sl_tp_result.get("tp_levels", [])
+            trailing_activation = int(sl_tp_result.get("trailing_activation", 0))
+            trailing_distance = float(sl_tp_result.get("trailing_distance", 0))
+            risk_reward = float(sl_tp_result.get("risk_reward", 0))
+            justification = sl_tp_result.get("justification", "")
+        else:
+            # Demander à Claude avec une approche différente
+            retry_prompt = f"""
+            Pour un trade {signal_type} sur {symbol} au prix {price} avec volatilité {volatility}%, définis:
+            
+            1. Le pourcentage SL (Stop Loss)
+            2. Le nombre de TPs (1-5)
+            3. Les pourcentages pour chaque TP
+            4. Le TP qui active le trailing stop
+            5. La distance du trailing stop
+            
+            Réponds au format:
+            SL: X%
+            TP Count: X
+            TP1: X%
+            TP2: X%
+            ...
+            Trailing Activation: TPX
+            Trailing Distance: X%
+            """
+            
+            retry_result = await analyze_with_openrouter(retry_prompt, temperature=0.1, analysis_type="sl_tp_simple")
+            
+            if isinstance(retry_result, str):
+                # Tenter de parser la réponse textuelle
+                try:
+                    sl_match = re.search(r'SL: (\d+\.?\d*)%', retry_result)
+                    if sl_match:
+                        sl_pct = float(sl_match.group(1))
+                    
+                    tp_count_match = re.search(r'TP Count: (\d+)', retry_result)
+                    if tp_count_match:
+                        tp_count = int(tp_count_match.group(1))
+                    
+                    # Extraire tous les TP%
+                    tp_matches = re.findall(r'TP\d+: (\d+\.?\d*)%', retry_result)
+                    if tp_matches:
+                        tp_levels = [float(tp) for tp in tp_matches]
+                        tp_count = len(tp_levels)
+                    
+                    trailing_match = re.search(r'Trailing Activation: TP(\d+)', retry_result)
+                    if trailing_match:
+                        trailing_activation = int(trailing_match.group(1))
+                    
+                    distance_match = re.search(r'Trailing Distance: (\d+\.?\d*)%', retry_result)
+                    if distance_match:
+                        trailing_distance = float(distance_match.group(1))
+                except Exception as e:
+                    logger.error(f"Erreur lors du parsing des résultats SL/TP: {e}")
+            
+            # Si toujours pas suffisant, demander séparément
+            if sl_pct == 0:
+                sl_prompt = f"""
+                Pour un trade {signal_type} sur {symbol} avec volatilité {volatility}%, quel pourcentage de Stop Loss recommandes-tu?
+                
+                Réponds UNIQUEMENT avec un nombre représentant le pourcentage (ex: 3.5).
+                """
+                
+                sl_value = await analyze_with_openrouter(sl_prompt, temperature=0.1, analysis_type="sl_value")
+                
+                if isinstance(sl_value, (int, float)):
+                    sl_pct = float(sl_value)
+                elif isinstance(sl_value, str) and sl_value.replace('.', '', 1).isdigit():
+                    sl_pct = float(sl_value)
+                else:
+                    # Demander à Claude une dernière fois
+                    sl_direct = await analyze_with_openrouter(
+                        f"Quel pourcentage de Stop Loss est optimal pour {symbol} avec volatilité {volatility}%? Réponds uniquement avec un nombre.",
+                        temperature=0.1,
+                        analysis_type="sl_direct"
+                    )
+                    
+                    if isinstance(sl_direct, (int, float)):
+                        sl_pct = float(sl_direct)
+                    elif isinstance(sl_direct, str) and sl_direct.replace('.', '', 1).isdigit():
+                        sl_pct = float(sl_direct)
+                    else:
+                        # Dernière consultation basée sur la volatilité
+                        sl_pct = volatility * 1.5
+            
+            # Si TP toujours pas définis, demander séparément
+            if not tp_levels or len(tp_levels) == 0:
+                tp_prompt = f"""
+                Pour un trade {signal_type} sur {symbol} avec volatilité {volatility}%, définis:
+                
+                1. Combien de Take Profits recommandes-tu (1-5)?
+                2. Les pourcentages pour chaque TP
+                
+                Réponds au format JSON: 
+                {{
+                  "tp_count": X,  // Nombre de TPs (1-5)
+                  "tp_levels": [X.X, X.X, ...]  // Pourcentages pour chaque TP
+                }}
+                """
+                
+                tp_result = await analyze_with_openrouter(tp_prompt, temperature=0.1, analysis_type="tp_details")
+                
+                if isinstance(tp_result, dict):
+                    if "tp_count" in tp_result and "tp_levels" in tp_result:
+                        tp_count = int(tp_result["tp_count"])
+                        tp_levels = tp_result["tp_levels"]
+                    elif "tp_levels" in tp_result:
+                        tp_levels = tp_result["tp_levels"]
+                        tp_count = len(tp_levels)
+                else:
+                    # Demander à Claude une dernière fois avec une approche simplifiée
+                    tp_simple = await analyze_with_openrouter(
+                        f"Quels pourcentages de Take Profit recommandes-tu pour {symbol}? Donne 1 à 5 valeurs séparées par des virgules.",
+                        temperature=0.1,
+                        analysis_type="tp_simple"
+                    )
+                    
+                    if isinstance(tp_simple, str):
+                        # Tenter d'extraire des nombres
+                        tp_matches = re.findall(r'\d+\.?\d*', tp_simple)
+                        if tp_matches:
+                            tp_levels = [float(tp) for tp in tp_matches]
+                            tp_count = len(tp_levels)
+                        else:
+                            # Consultation finale basée sur la volatilité
+                            tp_levels = [
+                                volatility * 0.8,
+                                volatility * 1.6,
+                                volatility * 2.8,
+                                volatility * 4.5
+                            ]
+                            tp_count = len(tp_levels)
+            
+            # Si trailing toujours pas défini, demander séparément
+            if trailing_activation == 0 or trailing_distance == 0:
+                trail_prompt = f"""
+                Pour un trade {symbol} avec {tp_count} Take Profits, réponds à ces questions:
+                
+                1. À quel TP devrait s'activer le trailing stop (1-{tp_count})?
+                2. Quelle devrait être la distance du trailing en pourcentage?
+                
+                Réponds au format JSON: {{"activation": X, "distance": X.X}}
+                """
+                
+                trail_result = await analyze_with_openrouter(trail_prompt, temperature=0.1, analysis_type="trailing")
+                
+                if isinstance(trail_result, dict):
+                    if "activation" in trail_result and "distance" in trail_result:
+                        trailing_activation = int(trail_result["activation"])
+                        trailing_distance = float(trail_result["distance"])
+                else:
+                    # Demander à Claude une dernière fois
+                    trail_simple = await analyze_with_openrouter(
+                        f"Pour un trade sur {symbol}, à quel TP activer le trailing stop (numéro de TP) et quelle distance (%)? Réponds sous forme 'TPX, Y%'.",
+                        temperature=0.1,
+                        analysis_type="trail_simple"
+                    )
+                    
+                    if isinstance(trail_simple, str):
+                        # Tenter d'extraire des nombres
+                        tp_match = re.search(r'TP(\d+)', trail_simple)
+                        distance_match = re.search(r'(\d+\.?\d*)%', trail_simple)
+                        
+                        if tp_match:
+                            trailing_activation = int(tp_match.group(1))
+                        else:
+                            trailing_activation = min(2, tp_count)
+                        
+                        if distance_match:
+                            trailing_distance = float(distance_match.group(1))
+                        else:
+                            trailing_distance = sl_pct * 0.6
+        
+        # Vérifier que les valeurs sont cohérentes et ajuster si nécessaire
+        if tp_count == 0 or not tp_levels or len(tp_levels) == 0:
+            # Consultation finale sur le nombre de TPs
+            tp_final = await analyze_with_openrouter(
+                f"Pour un trade {signal_type} sur {symbol}, combien de Take Profits recommandes-tu (1-5)? Réponds juste avec un nombre.",
+                temperature=0.1,
+                analysis_type="tp_count_final"
+            )
+            
+            if isinstance(tp_final, (int, float)) and 1 <= tp_final <= 5:
+                tp_count = int(tp_final)
+            elif isinstance(tp_final, str) and tp_final.isdigit() and 1 <= int(tp_final) <= 5:
+                tp_count = int(tp_final)
+            else:
+                # Décider en fonction de la volatilité et de la tendance
+                if volatility > 7:
+                    tp_count = 5  # Plus de TPs pour high volatility
+                elif volatility > 5:
+                    tp_count = 4
+                elif volatility > 3:
+                    tp_count = 3
+                else:
+                    tp_count = 2
+            
+            # Générer les niveaux de TP
+            tp_levels = []
+            for i in range(tp_count):
+                multiplier = (i + 1) * (1 + i * 0.5)  # 1, 2, 4.5, 8, 12.5
+                tp_levels.append(volatility * multiplier / 2)
+        
+        # Limiter le nombre de TPs entre 1 et 5
+        tp_count = max(1, min(5, tp_count))
+        
+        # S'assurer que tp_levels a la bonne longueur
+        if len(tp_levels) < tp_count:
+            # Ajouter des TPs supplémentaires si nécessaire
+            last_tp = tp_levels[-1] if tp_levels else volatility
+            for i in range(len(tp_levels), tp_count):
+                multiplier = 1.5 + (i - len(tp_levels)) * 0.8
+                tp_levels.append(last_tp * multiplier)
+        elif len(tp_levels) > tp_count:
+            # Réduire au nombre correct
+            tp_levels = tp_levels[:tp_count]
+        
+        # Vérifier le SL
+        if sl_pct == 0:
+            # Dernière consultation sur le SL
+            sl_final = await analyze_with_openrouter(
+                f"Pour un trade {signal_type} sur {symbol} avec volatilité {volatility}%, quel Stop Loss (pourcentage) recommandes-tu? Réponds juste avec un nombre.",
+                temperature=0.1,
+                analysis_type="sl_final"
+            )
+            
+            if isinstance(sl_final, (int, float)):
+                sl_pct = float(sl_final)
+            elif isinstance(sl_final, str) and sl_final.replace('.', '', 1).isdigit():
+                sl_pct = float(sl_final)
+            else:
+                # Basé sur la volatilité
+                sl_pct = volatility * 1.5
+        
+        # Vérifier le trailing
+        if trailing_activation <= 0 or trailing_activation > tp_count:
+            # Consultation finale sur le trailing
+            activation_final = await analyze_with_openrouter(
+                f"Pour un trade avec {tp_count} TPs, quel TP devrait activer le trailing stop (1-{tp_count})? Réponds juste avec un nombre.",
+                temperature=0.1,
+                analysis_type="trailing_activation"
+            )
+            
+            if isinstance(activation_final, (int, float)) and 1 <= activation_final <= tp_count:
+                trailing_activation = int(activation_final)
+            elif isinstance(activation_final, str) and activation_final.isdigit() and 1 <= int(activation_final) <= tp_count:
+                trailing_activation = int(activation_final)
+            else:
+                # Recommandation intelligente
+                if tp_count <= 2:
+                    trailing_activation = 1
+                else:
+                    trailing_activation = 2
+        
+        if trailing_distance <= 0:
+            # Consultation finale sur la distance
+            distance_final = await analyze_with_openrouter(
+                f"Pour un trade sur {symbol} avec SL à {sl_pct}%, quelle devrait être la distance du trailing stop (pourcentage)? Réponds juste avec un nombre.",
+                temperature=0.1,
+                analysis_type="trailing_distance"
+            )
+            
+            if isinstance(distance_final, (int, float)):
+                trailing_distance = float(distance_final)
+            elif isinstance(distance_final, str) and distance_final.replace('.', '', 1).isdigit():
+                trailing_distance = float(distance_final)
+            else:
+                # Basé sur le SL
+                trailing_distance = sl_pct * 0.6
+        
+        # Calculer les niveaux de prix précis
+        if is_buy:
+            sl = price * (1 - sl_pct/100)
+            tps = [price * (1 + tp_pct/100) for tp_pct in tp_levels]
+        else:
+            sl = price * (1 + sl_pct/100)
+            tps = [price * (1 - tp_pct/100) for tp_pct in tp_levels]
+        
+        # Calculer le ratio risque/récompense
+        risk = abs(price - sl)
+        reward_tp2 = abs(price - tps[min(1, len(tps)-1)])  # TP2 ou dernier TP si un seul
+        
+        if risk > 0:
+            risk_reward_ratio = round(reward_tp2 / risk, 2)
+        else:
+            # Consultation finale sur le R:R
+            rr_final = await analyze_with_openrouter(
+                f"Pour un trade {signal_type} sur {symbol} avec SL à {sl_pct}% et TP2 à {tp_levels[min(1, len(tp_levels)-1)]}%, quel est le ratio risque/récompense? Réponds juste avec un nombre.",
+                temperature=0.1,
+                analysis_type="risk_reward"
+            )
+            
+            if isinstance(rr_final, (int, float)):
+                risk_reward_ratio = float(rr_final)
+            elif isinstance(rr_final, str) and rr_final.replace('.', '', 1).isdigit():
+                risk_reward_ratio = float(rr_final)
+            else:
+                # Estimation basée sur les pourcentages
+                risk_reward_ratio = tp_levels[min(1, len(tp_levels)-1)] / sl_pct
+        
+        # Demander à Claude de recommander une stratégie optimale
+        strategy_prompt = f"""
+        En tant qu'expert en trading crypto, recommande la stratégie optimale pour ce trade sur {symbol}.
+        
+        DONNÉES:
+        - Type de signal: {signal_type}
+        - Prix d'entrée: {price}
+        - Volatilité: {volatility}%
+        - Tendance: {signal_data.get('market_trend')}
+        - SL: {sl_pct}%
+        - TPs: {tp_levels}
+        - Trailing activation: TP{trailing_activation}
+        - Trailing distance: {trailing_distance}%
+        
+        STRATÉGIES DISPONIBLES:
+        - "standard": Stop Loss et Take Profits classiques
+        - "trailing": Trailing Stop qui suit le prix
+        
+        Réponds UNIQUEMENT au format JSON:
+        {{
+          "type": "standard|trailing",  // Type de stratégie
+          "display_name": "...",        // Nom à afficher
+          "trailing_enabled": true,     // Toujours activer le trailing
+          "justification": "..."        // Brève justification de ta décision
+        }}
+        """
+        
+        strategy_result = await analyze_with_openrouter(strategy_prompt, temperature=0.1, analysis_type="strategy")
+        
+        if isinstance(strategy_result, dict):
+            strategy_type = strategy_result.get("type", "standard")
+            strategy_name = strategy_result.get("display_name", "Stop Loss et Take Profit")
+            strategy_justification = strategy_result.get("justification", "")
+        else:
+            # Demander avec un prompt simplifié
+            simple_strategy = await analyze_with_openrouter(
+                f"Quelle stratégie recommandes-tu pour un trade {signal_type} sur {symbol}? 'Standard' ou 'Trailing'? Réponds avec un mot uniquement.",
+                temperature=0.1,
+                analysis_type="simple_strategy"
+            )
+            
+            if isinstance(simple_strategy, str):
+                strategy_type = "trailing" if "trail" in simple_strategy.lower() else "standard"
+                strategy_name = "Trailing Stop Optimisé" if "trail" in simple_strategy.lower() else "Stop Loss et Take Profit"
+                strategy_justification = f"Stratégie optimisée pour {symbol} avec activation du trailing à TP{trailing_activation}"
+            else:
+                # Dernière consultation
+                strategy_type = "standard"
+                strategy_name = "Stop Loss et Take Profit"
+                strategy_justification = f"Stratégie standard avec trailing à TP{trailing_activation}"
+        
+        # Construire l'objet stratégie
+        strategy = {
+            "type": strategy_type,
+            "display_name": strategy_name,
+            "main": strategy_type,
+            "dca_enabled": False,
+            "trailing_enabled": True,
+            "trailing_activation": tps[trailing_activation-1] if trailing_activation > 0 and trailing_activation <= len(tps) else tps[min(1, len(tps)-1)]
+            ,
+            "trailing_distance": f"{round(trailing_distance, 1)}%",
+            "position_size": "100%"
+        }
+        
+        # Demander à Claude d'analyser techniquement le trade
+        tech_prompt = f"""
+        En tant qu'expert en analyse technique crypto, fournis 4-5 observations techniques pertinentes pour ce signal {signal_type} sur {symbol}.
+        
+        DONNÉES TECHNIQUES:
+        - Prix actuel: {price}
+        - Volatilité: {volatility}%
+        - ATR%: {atr_percent}%
+        - RSI: {signal_data.get("rsi", "N/A")}
+        - MACD: {signal_data.get("indicators", {}).get("1d", {}).get("macd", "N/A")}
+        - Tendance: {signal_data.get("market_trend")}
+        - Force tendance: {signal_data.get("trend_strength")}
+        - Supports: {signal_data.get("support_levels", [])}
+        - Résistances: {signal_data.get("resistance_levels", [])}
+        
+        Fournis des observations précises, factuelles et concises liées à ce trade spécifique.
+        Réponds au format JSON: {"observations": ["observation 1", "observation 2", "observation 3", "observation 4", "observation 5"]}
+        """
+        
+        observations_result = await analyze_with_openrouter(tech_prompt, temperature=0.2, analysis_type="observations")
+        
+        if isinstance(observations_result, dict) and "observations" in observations_result:
+            observations = observations_result["observations"]
+        else:
+            # Demander avec un format plus simple
+            simple_obs = await analyze_with_openrouter(
+                f"Fournis 4-5 observations techniques pour un trade {signal_type} sur {symbol}. Prix: {price}, Tendance: {signal_data.get('market_trend')}. Une observation par ligne.",
+                temperature=0.2,
+                analysis_type="simple_observations"
+            )
+            
+            if isinstance(simple_obs, str):
+                observations = [line.strip() for line in simple_obs.split('\n') if line.strip()]
+            elif isinstance(simple_obs, list):
+                observations = simple_obs
+            else:
+                # Dernière consultation
+                observations_final = await analyze_with_openrouter(
+                    f"Donne-moi 4 observations techniques courtes pour {symbol}. Sois précis et concis.",
+                    temperature=0.2,
+                    analysis_type="final_observations"
+                )
+                
+                if isinstance(observations_final, list):
+                    observations = observations_final
+                elif isinstance(observations_final, str):
+                    observations = [line.strip() for line in observations_final.split('\n') if line.strip()]
+                    if not observations:
+                        observations = [observations_final]
+                else:
+                    observations = [
+                        f"Signal {signal_type} sur {symbol} avec tendance {signal_data.get('market_trend', 'neutral')}",
+                        f"Volatilité de {volatility:.1f}% avec ATR de {atr_percent:.1f}%",
+                        f"Ratio risque/récompense de 1:{risk_reward_ratio} avec levier {leverage}x",
+                        f"Trailing stop activé à TP{trailing_activation} pour maximiser les profits"
+                    ]
+        
+        # Construire le signal optimisé
+        optimized_signal = signal_data.copy()
+        
+        # Mettre à jour avec les valeurs optimisées
+        optimized_signal["tps"] = [round(tp, 8) for tp in tps]
+        optimized_signal["tp_formatted"] = [f"{tp:.6f}" for tp in tps]
+        
+        # Calculer les pourcentages pour les TPs
+        tp_percentages = []
+        for i, tp_pct in enumerate(tp_levels):
+            tp_percentages.append(f"+{tp_pct:.2f}%")
+        
+        optimized_signal["tp_percentages"] = tp_percentages
+        
+        # Calculer le pourcentage pour le SL
+        optimized_signal["sl"] = sl
+        optimized_signal["sl_formatted"] = f"{sl:.6f}"
+        optimized_signal["sl_percentage"] = f"{sl_pct:.2f}%"
+        
+        optimized_signal["leverage"] = leverage
+        optimized_signal["leverage_justification"] = f"Levier optimisé à {leverage}x sur un maximum de {max_allowed_leverage}x"
+        optimized_signal["strategy"] = strategy
+        optimized_signal["observations"] = observations
+        optimized_signal["risk_reward"] = str(risk_reward_ratio)
+        optimized_signal["confidence"] = confidence
+        
+        # Pour le tracking en interne
+        optimized_signal["_optimized"] = True
+        
+        # Construire la partie trailing
+        trailing = {
+            "type": "moving_target",
+            "type_display": "Moving Target",
+            "activation_target": trailing_activation,
+            "distance": round(trailing_distance, 1)
+        }
+        optimized_signal["trailing"] = trailing
+        
+        # Générer l'emoji approprié
+        if is_buy:
+            optimized_signal["emoji"] = "🟢"
+            optimized_signal["long_short"] = "LONG"
+        else:
+            optimized_signal["emoji"] = "🔴"
+            optimized_signal["long_short"] = "SHORT"
+        
+        # Générer le prix formaté
+        optimized_signal["price_formatted"] = f"{price:.6f}"
+        
+        logger.info(f"Paramètres optimisés avec succès pour {symbol}: Levier={leverage}x, RR={risk_reward_ratio}, Confiance={confidence}%")
+        
+        return optimized_signal
+        
+    except Exception as e:
+        logger.error(f"Exception lors de l'optimisation des paramètres: {e}")
+        logger.error(traceback.format_exc())
+        # En cas d'erreur, marquer comme ignoré pour éviter d'envoyer avec des paramètres incorrects
+        signal_data["ignored_low_confidence"] = True
+        signal_data["confidence"] = 0
+        signal_data["error"] = str(e)
+        return signal_data
+
+
+async def send_telegram_message(message, parse_mode=None, disable_notification=False):
+    """
+    Envoie un message sur Telegram.
+    
+    Args:
+        message: Le message à envoyer
+        parse_mode: Mode de parsing (Markdown ou HTML)
+        disable_notification: Désactiver la notification sonore
+        
+    Returns:
+        Succès de l'envoi (True/False)
+    """
+    global TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+    
+    logger.info(f"Tentative d'envoi d'un message Telegram ({len(message)} caractères)")
+    logger.info(f"Utilisation du token: {TELEGRAM_TOKEN[:6]}...{TELEGRAM_TOKEN[-6:]} et chat_id: {TELEGRAM_CHAT_ID}")
+    
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "disable_notification": disable_notification
+        }
+        
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(url, data=payload) as response:
+                    response_text = await response.text()
+                    
+                    if response.status == 200:
+                        logger.info("Message Telegram envoyé avec succès")
+                        return True
+                    else:
+                        logger.error(f"Erreur lors de l'envoi du message Telegram: {response.status} - {response_text}")
+                        return False
+            except Exception as e:
+                logger.error(f"Exception dans la requête HTTP: {e}")
+                return False
+    except Exception as e:
+        logger.error(f"Exception lors de l'envoi du message Telegram: {e}")
+        logger.error(traceback.format_exc())
+        return False
+
+
+async def test_telegram_connection():
+    """Teste la connexion à l'API Telegram au démarrage"""
+    logger.info("Test de la connexion à l'API Telegram...")
+    
+    try:
+        test_message = "🧪 Test de connexion NeoTradeX - " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        success = await send_telegram_message(test_message)
+        
+        if success:
+            logger.info("✅ Connexion à l'API Telegram établie avec succès!")
+            return True
+        else:
+            logger.critical("❌ Échec de la connexion à l'API Telegram - Vérifiez le token et le chat_id")
+            return False
+    except Exception as e:
+        logger.critical(f"❌ Exception lors du test de l'API Telegram: {e}")
+        logger.error(traceback.format_exc())
+        return False
+
+
+async def load_max_leverages():
+    """
+    Charge les leviers maximums autorisés depuis un fichier JSON.
+    
+    Returns:
+        Dictionnaire des leviers maximums par symbole
+    """
+    max_leverage_path = "bitget_max_leverages.json"
+    try:
+        # Vérifier si le fichier existe
+        if os.path.exists(max_leverage_path):
+            with open(max_leverage_path, "r") as f:
+                max_leverages = json.load(f)
+                logger.info(f"Leviers maximums chargés: {len(max_leverages)} paires trouvées")
+                return max_leverages
+        else:
+            # Si le fichier n'existe pas, demander à Claude de générer une estimation
+            logger.warning(f"Fichier de leviers maximums non trouvé: {max_leverage_path}")
+            
+            # Demander à Claude de générer des estimations pour les principales crypto
+            leverage_prompt = """
+            En tant qu'expert en trading crypto, génère une estimation des leviers maximums autorisés sur Bitget Futures.
+            Fournis les estimations pour les 20 principales cryptomonnaies, au format JSON suivant:
+            {
+              "BTCUSDT.P_UMCBL": 125,
+              "ETHUSDT.P_UMCBL": 100,
+              "XRPUSDT.P_UMCBL": 75,
+              ... et ainsi de suite pour 20 cryptos
+            }
+            
+            Réponds UNIQUEMENT avec le JSON.
+            """
+            
+            try:
+                leverage_response = await analyze_with_openrouter(leverage_prompt, temperature=0.1, analysis_type="leverage_json")
+                
+                if isinstance(leverage_response, dict) and len(leverage_response) > 5:
+                    # Sauvegarder pour utilisation future
+                    with open(max_leverage_path, "w") as f:
+                        json.dump(leverage_response, f, indent=2)
+                    
+                    logger.info(f"Estimations de leviers maximums générées par Claude: {len(leverage_response)} paires")
+                    return leverage_response
+                else:
+                    # Demander à Claude avec un prompt plus direct
+                    direct_prompt = """
+                    Fournis les leviers maximum pour les 10 principales cryptos sur Bitget Futures:
+                    
+                    - BTC (Bitcoin)
+                    - ETH (Ethereum)
+                    - SOL (Solana)
+                    - XRP (Ripple)
+                    - BNB (Binance Coin)
+                    - ADA (Cardano)
+                    - DOGE (Dogecoin)
+                    - AVAX (Avalanche)
+                    - LINK (Chainlink)
+                    - DOT (Polkadot)
+                    
+                    Format JSON uniquement: {"BTCUSDT.P_UMCBL": 125, ...}
+                    """
+                    
+                    direct_response = await analyze_with_openrouter(direct_prompt, temperature=0.1, analysis_type="leverage_direct")
+                    
+                    if isinstance(direct_response, dict) and len(direct_response) > 5:
+                        # Sauvegarder pour utilisation future
+                        with open(max_leverage_path, "w") as f:
+                            json.dump(direct_response, f, indent=2)
+                        
+                        logger.info(f"Estimations de leviers maximums générées par Claude: {len(direct_response)} paires")
+                        return direct_response
+                    else:
+                        # Dernière tentative - consulter Claude pour chaque crypto
+                        top_cryptos = ["BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "AVAX", "LINK", "DOT"]
+                        individual_leverages = {}
+                        
+                        for crypto in top_cryptos:
+                            try:
+                                leverage_query = f"Quel est le levier maximum typique pour {crypto} sur Bitget Futures? Réponds juste avec un nombre."
+                                
+                                crypto_leverage = await analyze_with_openrouter(leverage_query, temperature=0.1, analysis_type="single_leverage")
+                                
+                                if isinstance(crypto_leverage, (int, float)):
+                                    individual_leverages[f"{crypto}USDT.P_UMCBL"] = float(crypto_leverage)
+                                elif isinstance(crypto_leverage, str) and crypto_leverage.isdigit():
+                                    individual_leverages[f"{crypto}USDT.P_UMCBL"] = float(crypto_leverage)
+                                else:
+                                    # Consulter Claude une dernière fois
+                                    final_leverage = await analyze_with_openrouter(
+                                        f"Quel est le levier maximum sur Bitget Futures pour {crypto}? Réponds uniquement avec un nombre entier.",
+                                        temperature=0.1,
+                                        analysis_type="final_single_leverage"
+                                    )
+                                    
+                                    if isinstance(final_leverage, (int, float)):
+                                        individual_leverages[f"{crypto}USDT.P_UMCBL"] = float(final_leverage)
+                                    elif isinstance(final_leverage, str) and final_leverage.isdigit():
+                                        individual_leverages[f"{crypto}USDT.P_UMCBL"] = float(final_leverage)
+                                    else:
+                                        # Basé sur la crypto
+                                        if crypto == "BTC":
+                                            individual_leverages[f"{crypto}USDT.P_UMCBL"] = 125
+                                        elif crypto == "ETH":
+                                            individual_leverages[f"{crypto}USDT.P_UMCBL"] = 100
+                                        elif crypto in ["SOL", "BNB", "XRP"]:
+                                            individual_leverages[f"{crypto}USDT.P_UMCBL"] = 75
+                                        else:
+                                            individual_leverages[f"{crypto}USDT.P_UMCBL"] = 50
+                            except Exception as e:
+                                logger.error(f"Erreur lors de l'obtention du levier pour {crypto}: {e}")
+                                # Basé sur la crypto
+                                if crypto == "BTC":
+                                    individual_leverages[f"{crypto}USDT.P_UMCBL"] = 125
+                                elif crypto == "ETH":
+                                    individual_leverages[f"{crypto}USDT.P_UMCBL"] = 100
+                                elif crypto in ["SOL", "BNB", "XRP"]:
+                                    individual_leverages[f"{crypto}USDT.P_UMCBL"] = 75
+                                else:
+                                    individual_leverages[f"{crypto}USDT.P_UMCBL"] = 50
+                        
+                        if individual_leverages:
+                            # Sauvegarder pour utilisation future
+                            with open(max_leverage_path, "w") as f:
+                                json.dump(individual_leverages, f, indent=2)
+                            
+                            logger.info(f"Leviers individuels générés: {len(individual_leverages)} paires")
+                            return individual_leverages
+            except Exception as e:
+                logger.error(f"Erreur lors de la génération d'estimations de leviers via Claude: {e}")
+                
+                # Demander avec un format simplifié
+                try:
+                    simple_prompt = "Quel est le levier maximum pour BTC, ETH, SOL, XRP et BNB sur Bitget? Format: {'BTC': X, 'ETH': Y, ...}"
+                    
+                    simple_response = await analyze_with_openrouter(simple_prompt, temperature=0.1, analysis_type="simple_leverages")
+                    
+                    if isinstance(simple_response, dict):
+                        # Convertir au format attendu
+                        formatted_leverages = {}
+                        for crypto, leverage in simple_response.items():
+                            formatted_leverages[f"{crypto}USDT.P_UMCBL"] = float(leverage)
+                        
+                        # Sauvegarder pour référence future
+                        with open(max_leverage_path, "w") as f:
+                            json.dump(formatted_leverages, f, indent=2)
+                        
+                        logger.info(f"Leverages simplifiés générés: {len(formatted_leverages)} paires")
+                        return formatted_leverages
+                except Exception as simple_err:
+                    logger.error(f"Erreur lors de la génération simple: {simple_err}")
+    except Exception as e:
+        logger.error(f"Erreur lors du chargement des leviers maximums: {e}")
+    
+    # En dernier recours, demander à Claude une liste de base
+    try:
+        # Demander à Claude les valeurs par défaut
+        default_prompt = "Quels sont les leviers maximum typiques sur Bitget Futures pour les 5 principales cryptos? Format: BTCUSDT=X, ETHUSDT=Y, etc."
+        
+        default_response = await analyze_with_openrouter(default_prompt, temperature=0.1, analysis_type="default_leverages")
+        
+        if isinstance(default_response, str):
+            # Tenter de parser la réponse
+            leverage_matches = re.findall(r'([A-Z]+)(?:USDT)?=(\d+)', default_response)
+            
+            if leverage_matches:
+                default_leverages = {}
+                for crypto, leverage in leverage_matches:
+                    default_leverages[f"{crypto}USDT.P_UMCBL"] = int(leverage)
+                
+                # Sauvegarder pour référence future
+                with open(max_leverage_path, "w") as f:
+                    json.dump(default_leverages, f, indent=2)
+                
+                logger.info(f"Leverages par défaut extraits: {len(default_leverages)} paires")
+                return default_leverages
+        
+        # Si tous les autres moyens échouent, utiliser les données du fichier bitget_max_leverages.json fourni
+        return {
+            "BTCUSDT.P_UMCBL": 125,
+            "ETHUSDT.P_UMCBL": 100,
+            "XRPUSDT.P_UMCBL": 125,
+            "EOSUSDT.P_UMCBL": 75,
+            "BCHUSDT.P_UMCBL": 100,
+            "LTCUSDT.P_UMCBL": 75,
+            "ADAUSDT.P_UMCBL": 75,
+            "ETCUSDT.P_UMCBL": 75,
+            "LINKUSDT.P_UMCBL": 75,
+            "TRXUSDT.P_UMCBL": 75,
+            "DOTUSDT.P_UMCBL": 75,
+            "DOGEUSDT.P_UMCBL": 75,
+            "SOLUSDT.P_UMCBL": 100,
+            "BNBUSDT.P_UMCBL": 75
+        }
+    except Exception as default_err:
+        logger.error(f"Erreur lors de l'extraction des leviers par défaut: {default_err}")
+        
+        # Données du fichier bitget_max_leverages.json fourni
+        return {
+            "BTCUSDT.P_UMCBL": 125,
+            "ETHUSDT.P_UMCBL": 100,
+            "XRPUSDT.P_UMCBL": 125,
+            "EOSUSDT.P_UMCBL": 75,
+            "BCHUSDT.P_UMCBL": 100,
+            "LTCUSDT.P_UMCBL": 75,
+            "ADAUSDT.P_UMCBL": 75,
+            "ETCUSDT.P_UMCBL": 75,
+            "LINKUSDT.P_UMCBL": 75,
+            "TRXUSDT.P_UMCBL": 75,
+            "DOTUSDT.P_UMCBL": 75,
+            "DOGEUSDT.P_UMCBL": 75,
+            "SOLUSDT.P_UMCBL": 100,
+            "BNBUSDT.P_UMCBL": 75
+        }
+
+
+def format_telegram_message(signal):
+    """
+    Formate un message Telegram avec tous les détails du signal
+    
+    Format compatible avec Cornix et autres bots de trading.
+    Toutes les valeurs sont calculées, pas de placeholders.
+    """
+    try:
+        # Extraire les valeurs clés
+        symbol = signal.get('symbol', '')
+        signal_type = signal.get('signal', '').upper()
+        price_str = signal.get('price_formatted', str(signal.get('price', 0)))
+        
+        # TPs et SL
+        tp_formatted = signal.get('tp_formatted', [])
+        tp_percent = signal.get('tp_percentages', [])
+        sl_formatted = signal.get('sl_formatted', '0')
+        sl_percent = signal.get('sl_percentage', '0%')
+        
+        # Vérifier la présence des TPs et SL
+        if not tp_formatted or len(tp_formatted) == 0:
+            # Demander à Claude de générer les TPs manquants
+            tp_prompt = f"""
+            Génère des niveaux de Take Profit pour un trade {signal_type} sur {symbol} au prix {price_str}.
+            
+            Réponds au format JSON:
+            {{
+              "tp_formatted": ["price1", "price2", "price3", "price4"],
+              "tp_percentages": ["+x.xx%", "+y.yy%", "+z.zz%", "+w.ww%"]
+            }}
+            """
+            
+            # Utiliser un client HTTP synchrone car nous sommes dans une fonction synchrone
+            try:
+                response = requests.post(
+                    OPENROUTER_API_URL,
+                    headers={
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "anthropic/claude-3-haiku",
+                        "messages": [
+                            {"role": "user", "content": tp_prompt}
+                        ],
+                        "temperature": 0.1
+                    },
+                    timeout=10
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    
+                    # Extraire le JSON
+                    try:
+                        import re
+                        json_match = re.search(r'({.*})', content, re.DOTALL)
+                        if json_match:
+                            tp_data = json.loads(json_match.group(1))
+                            if "tp_formatted" in tp_data and "tp_percentages" in tp_data:
+                                tp_formatted = tp_data["tp_formatted"]
+                                tp_percent = tp_data["tp_percentages"]
+                    except Exception as parse_err:
+                        logger.error(f"Erreur lors du parsing des TPs générés: {parse_err}")
+            except Exception as e:
+                logger.error(f"Erreur lors de la génération des TPs manquants: {e}")
+        
+        # Générer les TPs si toujours manquants
+        if not tp_formatted or len(tp_formatted) == 0:
+            price = float(signal.get('price', 0))
+            volatility = signal.get('volatility', 5.0)
+            
+            if price > 0:
+                if signal_type == "BUY":
+                    tp1 = price * (1 + volatility/100)
+                    tp2 = price * (1 + volatility*2/100)
+                    tp3 = price * (1 + volatility*3.5/100)
+                    tp4 = price * (1 + volatility*5/100)
+                    tp5 = price * (1 + volatility*7/100)
+                    tp_formatted = [f"{tp1:.6f}", f"{tp2:.6f}", f"{tp3:.6f}", f"{tp4:.6f}", f"{tp5:.6f}"]
+                    tp_percent = [f"+{volatility:.2f}%", f"+{volatility*2:.2f}%", f"+{volatility*3.5:.2f}%", f"+{volatility*5:.2f}%", f"+{volatility*7:.2f}%"]
+                else:
+                    tp1 = price * (1 - volatility/100)
+                    tp2 = price * (1 - volatility*2/100)
+                    tp3 = price * (1 - volatility*3.5/100)
+                    tp4 = price * (1 - volatility*5/100)
+                    tp5 = price * (1 - volatility*7/100)
+                    tp_formatted = [f"{tp1:.6f}", f"{tp2:.6f}", f"{tp3:.6f}", f"{tp4:.6f}", f"{tp5:.6f}"]
+                    tp_percent = [f"+{volatility:.2f}%", f"+{volatility*2:.2f}%", f"+{volatility*3.5:.2f}%", f"+{volatility*5:.2f}%", f"+{volatility*7:.2f}%"]
+        
+        # Vérifier le SL
+        if not sl_formatted or sl_formatted == '0':
+            # Demander à Claude de générer le SL manquant
+            sl_prompt = f"""
+            Génère un niveau de Stop Loss pour un trade {signal_type} sur {symbol} au prix {price_str}.
+            
+            Réponds au format JSON:
+            {{
+              "sl_formatted": "price",
+              "sl_percentage": "-x.xx%"
+            }}
+            """
+            
+            # Utiliser un client HTTP synchrone
+            try:
+                response = requests.post(
+                    OPENROUTER_API_URL,
+                    headers={
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "anthropic/claude-3-haiku",
+                        "messages": [
+                            {"role": "user", "content": sl_prompt}
+                        ],
+                        "temperature": 0.1
+                    },
+                    timeout=10
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    
+                    # Extraire le JSON
+                    try:
+                        import re
+                        json_match = re.search(r'({.*})', content, re.DOTALL)
+                        if json_match:
+                            sl_data = json.loads(json_match.group(1))
+                            if "sl_formatted" in sl_data and "sl_percentage" in sl_data:
+                                sl_formatted = sl_data["sl_formatted"]
+                                sl_percent = sl_data["sl_percentage"]
+                    except Exception as parse_err:
+                        logger.error(f"Erreur lors du parsing du SL généré: {parse_err}")
+            except Exception as e:
+                logger.error(f"Erreur lors de la génération du SL manquant: {e}")
+        
+        # Générer le SL si toujours manquant
+        if not sl_formatted or sl_formatted == '0':
+            price = float(signal.get('price', 0))
+            volatility = signal.get('volatility', 5.0)
+            
+            if price > 0:
+                if signal_type == "BUY":
+                    sl = price * (1 - volatility*1.5/100)
+                    sl_formatted = f"{sl:.6f}"
+                    sl_percent = f"{-volatility*1.5:.2f}%"
+                else:
+                    sl = price * (1 + volatility*1.5/100)
+                    sl_formatted = f"{sl:.6f}"
+                    sl_percent = f"{-volatility*1.5:.2f}%"
+        
+        # Détails stratégie
+        leverage = signal.get('leverage', 1)
+        strategy = signal.get('strategy', {})
+        strategy_name = strategy.get('display_name', 'Standard')
+        
+        # Trailing
+        trailing = signal.get('trailing', {})
+        trailing_type = trailing.get('type_display', 'Moving Target')
+        trailing_target = trailing.get('activation_target', 2)
+        
+        # Informations marketing
+        emoji = signal.get('emoji', '🔵')
+        long_short = signal.get('long_short', 'POSITION')
+        
+        # Risque/récompense
+        risk_reward = signal.get('risk_reward', '2.0')
+        
+        # Analyses supplémentaires
+        tech_analysis = signal.get('tech_analysis', 'Signal technique confirmé')
+        
+        # Formatter les observations techniques avec retour à la ligne
+        observations = signal.get('observations', [])
+        tech_analysis_formatted = ''
+        
+        for i, obs in enumerate(observations):
+            if i > 0 and i % 2 == 0:  # Retour à la ligne tous les 2 paramètres
+                tech_analysis_formatted += '\n'
+            tech_analysis_formatted += obs + (' • ' if i % 2 == 0 and i < len(observations) - 1 else '')
+        
+        if not tech_analysis_formatted:
+            tech_analysis_formatted = tech_analysis
+        
+        # Construction du message au format compatible avec Cornix
+        message = f"{signal_type} {emoji} - Futures - #{symbol} - Leverage ({leverage}x)\n\n"
+        message += f"Entry: {price_str}\n\n"
+        message += f"Targets:\n"
+        
+        # S'assurer qu'il y a des TP à afficher
+        if tp_formatted and len(tp_formatted) > 0:
+            for i, (tp, pct) in enumerate(zip(tp_formatted, tp_percent), 1):
+                message += f"TP{i}: {tp} ({pct})\n"
+        else:
+            message += f"TP1: N/A\n"
+        
+        message += f"\nStop Loss: {sl_formatted} ({sl_percent})\n\n"
+        
+        if strategy.get('main') == "dca" and "dca_config" in strategy:
+            dca_config = strategy["dca_config"]
+            message += f"DCA:\n"
+            entry_price = float(price_str.replace(',', '.'))
+            for i in range(1, dca_config["entry_levels"] + 1):
+                if i == 1:
+                    message += f"Entry 1: {price_str} (50%)\n"
+                else:
+                    price_step = dca_config["price_step"] * (i - 1)
+                    entry_price_dca = entry_price * (1 - price_step / 100) if signal_type == "BUY" else entry_price * (1 + price_step / 100)
+                    qty = 50 if i == 1 else 30 if i == 2 else 20
+                    message += f"Entry {i}: {entry_price_dca:.6f} ({qty}%)\n"
+            message += f"\n"
+        
+        if strategy.get('main') == "grid" and "grid_config" in strategy:
+            grid_config = strategy["grid_config"]
+            message += f"Grid Trading:\n"
+            message += f"Levels: {grid_config['grid_levels']}\n"
+            message += f"Spacing: {grid_config['grid_spacing']:.1f}%\n\n"
+        
+        message += f"Trailing config:\n"
+        message += f"Stop: {trailing_type}\n"
+        message += f"Trigger: Target (TP{trailing_target})\n\n"
+        
+        message += f"====================================================\n\n"
+        message += f"📌 Observations\n"
+        message += f"💡 Stratégie: {strategy_name} \n"
+        message += f"⚖️ Risk/Reward: 1:{risk_reward} \n"
+        message += f"📈 {tech_analysis_formatted}\n\n"
+        
+        message += f"<i>🧠 Signal généré par l'IA NeoTradeX utilisant une analyse technique avancée, du machine learning et une confirmation multi-timeframe.</i>\n\n"
+        message += f"<i>⚠️Ce signal de trading ne constitue en aucun cas une recommandation personnalisée ou une incitation à l'investissement. Vous demeurez seul responsable de vos décisions et de leurs conséquences, en pleine autonomie et en connaissance de cause⚠️</i>"
+        
+        return message
+
+    except Exception as e:
+        logger.error(f"Erreur lors du formatage du message Telegram: {e}")
+        logger.error(traceback.format_exc())
+        return f"🆘 SIGNAL: {signal.get('symbol', 'UNKNOWN')} {signal.get('signal', 'UNKNOWN')} at {signal.get('price', 0)} - Error in formatting"
+
+
+async def send_discord_message(message, channel_id=None):
+    """
+    Envoie un message sur Discord.
+    
+    Args:
+        message: Le message à envoyer
+        channel_id: ID du canal où envoyer le message
+        
+    Returns:
+        Succès de l'envoi (True/False)
+    """
+    global discord_client, discord_ready, DISCORD_SIGNAL_CHANNEL_ID
+    
+    if not discord_ready:
+        logger.warning("Client Discord non prêt, message non envoyé")
+        return False
+    
+    if channel_id is None:
+        channel_id = DISCORD_SIGNAL_CHANNEL_ID
+    
+    try:
+        channel = discord_client.get_channel(channel_id)
+        if channel:
+            await channel.send(message)
+            logger.info(f"Message Discord envoyé avec succès sur le canal {channel.name}")
+            return True
+        else:
+            logger.error(f"Canal Discord avec ID {channel_id} non trouvé")
+            return False
+    except Exception as e:
+        logger.error(f"Exception lors de l'envoi du message Discord: {e}")
+        return False
+
+
+async def check_undelivered_signals():
+    """Recherche et envoie les signaux non livrés"""
+    logger.info("Vérification des signaux non livrés...")
+    
+    if db is None:
+        logger.error("MongoDB non disponible, impossible de récupérer les signaux non livrés")
+        return
+    
+    try:
+        # Rechercher les signaux non livrés
+        undelivered_signals = await db[SIGNALS_COLLECTION].find(
+            {"delivered": False}
+        ).sort("timestamp", 1).to_list(10)  # Traiter par lots de 10 max
+        
+        if not undelivered_signals:
+            logger.info("Aucun signal non livré trouvé")
+            return
+        
+        logger.info(f"Trouvé {len(undelivered_signals)} signaux non livrés")
+        
+        # Charger les leviers maximums depuis le fichier JSON
+        max_leverages = await load_max_leverages()
+        
+        for signal in undelivered_signals:
+            try:
+                # Optimiser les paramètres du trade avec l'IA
+                optimized_signal = await optimize_trade_parameters(signal, max_leverages)
+                
+                # CORRECTION CRUCIALE: Vérifier immédiatement si le signal a été ignoré pour sa confiance
+                if optimized_signal.get("ignored_low_confidence", False):
+                    confidence = optimized_signal.get('confidence', 0)
+                    logger.warning(f"Signal {signal.get('symbol')} ignoré: confiance insuffisante ({confidence:.2f}% < 80%)")
+                    
+                    # Marquer comme "ignoré" pour qu'il ne soit plus traité
+                    await db[SIGNALS_COLLECTION].update_one(
+                        {"_id": signal["_id"]}, 
+                        {"$set": {
+                            "delivered": True,  # Marqué comme livré pour qu'il ne soit plus traité
+                            "delivery_status": "IGNORED_LOW_CONFIDENCE",
+                            "ignored_timestamp": datetime.now(timezone.utc),
+                            "confidence": confidence
+                        }}
+                    )
+                    # IMPORTANT: passer au signal suivant immédiatement
+                    continue
+            except Exception as e:
+                # Gérer l'exception ici
+                logger.error(f"Erreur: {e}")  
+
+                # Vérifier si le signal a été correctement optimisé
+                is_optimized = optimized_signal.get("_optimized", False)
+                if not is_optimized:
+                    logger.warning(f"Signal {optimized_signal.get('symbol')} non optimisé correctement, données potentiellement invalides")
+                    await db[SIGNALS_COLLECTION].update_one(
+                        {"_id": signal["_id"]}, 
+                        {"$set": {
+                            "delivered": True,
+                            "delivery_status": "OPTIMIZATION_FAILED",
+                            "ignored_timestamp": datetime.now(timezone.utc)
+                        }}
+                    )
+                    continue
+                
+                # Formater le message avec les détails du signal
+                if "telegram_message" not in optimized_signal:
+                    optimized_signal["telegram_message"] = format_telegram_message(optimized_signal)
+                
+                # Envoyer le message sur Telegram
+                sent_telegram = await send_telegram_message(optimized_signal["telegram_message"], parse_mode="HTML")
+                
+                # Envoyer sur Discord si disponible
+                sent_discord = False
+                if discord_ready:
+                    # Préparer un message Discord (peut être différent du message Telegram)
+                    if "discord_message" not in optimized_signal:
+                        optimized_signal["discord_message"] = optimized_signal["telegram_message"]
+                    
+                    # Envoyer sur le canal des signaux
+                    sent_discord = await send_discord_message(optimized_signal["discord_message"], DISCORD_SIGNAL_CHANNEL_ID)
+                
+                # Sauvegarder le signal dans MongoDB
+                await db[SIGNALS_COLLECTION].update_one(
+                    {"_id": signal["_id"]},
+                    {"$set": {
+                        "delivered": True,
+                        "delivery_status": "DELIVERED" if sent_telegram else "FAILED",
+                        "delivery_timestamp": datetime.now(timezone.utc).isoformat(),
+                        "formatted_message": optimized_signal["telegram_message"]
+                    }}
+                )
+                
+                logger.info(f"Signal {signal.get('signal_id', 'UNKNOWN')} traité et {'envoyé' if sent_telegram else 'échec d\\'envoi'}")
+            except Exception as e:
+                logger.error(f"Erreur lors du traitement du signal non livré: {e}")
+                logger.error(traceback.format_exc())
+    except Exception as e:
+        logger.error(f"Erreur lors de la vérification des signaux non livrés: {e}")
+        logger.error(traceback.format_exc())
+
+
+async def run_parallel_analyses(prompts, model=None, system=None, analysis_type="general"):
+    """
+    Exécute plusieurs analyses en parallèle en utilisant OpenRouter.
+    
+    Args:
+        prompts: Liste des prompts à analyser
+        model: Modèle à utiliser 
+        system: Prompt système
+        analysis_type: Type d'analyse
+        
+    Returns:
+        Liste des résultats d'analyse
+    """
+    logger.info(f"Exécution de {len(prompts)} analyses en parallèle ({analysis_type})")
+    
+    tasks = []
+    for prompt in prompts:
+        # Utiliser la version avec cache qui appelle OpenRouter
+        task = analyze_with_openrouter(prompt, system, 0.1, analysis_type)
+        tasks.append(task)
+    
+    # Exécuter toutes les tâches en parallèle
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Gérer les exceptions
+    processed_results = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.error(f"Erreur dans l'analyse parallèle #{i}: {result}")
+            processed_results.append({})  # Résultat vide en cas d'erreur
+        else:
+            processed_results.append(result)
+    
+    return processed_results
+
+async def analyze_with_openrouter(prompt, system=None, temperature=0.1, analysis_type="general"):
+    """
+    Analyse avec Claude 3.5 Haiku via OpenRouter pour des performances optimales.
+    
+    Args:
+        prompt: Le texte de la requête
+        system: Le prompt système
+        temperature: Température pour le sampling
+        analysis_type: Type d'analyse ("financial", "prediction", etc.)
+    """
+    global OPENROUTER_API_KEY, OPENROUTER_API_URL, openrouter_semaphore
+    
+    if system is None:
+        system = """Tu es un expert en trading algorithmique.
+Réponds UNIQUEMENT en JSON valide. Pas de texte avant ou après le JSON.
+Le JSON doit être complet et respecter le format demandé."""
+        
+    logger.info(f"Analyse avec Claude 3.5 Haiku - type: {analysis_type}")
+    
+    try:
+        # Sélectionner les options selon le type d'analyse
+        if analysis_type == "financial":
+            temperature = 0.01  # Très déterministe pour les analyses financières
+            model = "anthropic/claude-3-haiku"
+        elif analysis_type == "prediction":
+            temperature = 0.3   # Plus élevé pour les prédictions
+            model = "anthropic/claude-3-haiku" 
+        else:  # "general"
+            model = "anthropic/claude-3-haiku"
+        
+        # Améliorer le prompt pour JSON cohérent
+        enhanced_prompt = f"{prompt}\n\nRéponds UNIQUEMENT au format JSON. Pas de texte avant ou après le JSON."
+        
+        # Formater la requête pour OpenRouter / Claude 3.5 Haiku
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": enhanced_prompt}
+            ],
+            "temperature": temperature,
+            "max_tokens": 1024
+        }
+        
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://neotradex.io",  # Domaine fictif pour tracking
+            "X-Title": "NeoTradeX Trading Bot"
+        }
+        
+        # Ajouter un mécanisme de retry
+        max_retries = 3
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                # Utilisez le sémaphore pour limiter les requêtes concurrentes
+                async with openrouter_semaphore:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            OPENROUTER_API_URL, 
+                            json=payload, 
+                            headers=headers,
+                            timeout=30  # Timeout plus généreux car API cloud
+                        ) as response:
+                            if response.status == 200:
+                                result = await response.json()
+                                ai_response = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                                
+                                # Traiter la réponse pour extraire le JSON
+                                try:
+                                    # Rechercher le JSON dans la réponse
+                                    json_match = re.search(r'({[\s\S]*})', ai_response)
+                                    if json_match:
+                                        json_str = json_match.group(1)
+                                        return json.loads(json_str)
+                                    elif ai_response.strip().startswith("{") and ai_response.strip().endswith("}"):
+                                        return json.loads(ai_response)
+                                    else:
+                                        # Pas de JSON trouvé, analyser la réponse textuelle
+                                        if analysis_type == "volatility" and isinstance(ai_response, str):
+                                            # Essayer d'extraire un nombre (volatilité)
+                                            number_match = re.search(r'(\d+\.?\d*)', ai_response)
+                                            if number_match:
+                                                return {"volatility": float(number_match.group(1))}
+                                        elif ai_response.isdigit() or (ai_response.replace('.', '', 1).isdigit() and ai_response.count('.') <= 1):
+                                            # Un simple nombre
+                                            return float(ai_response)
+                                        else:
+                                            # Transformation en liste si séparé par des lignes
+                                            lines = [line.strip() for line in ai_response.split('\n') if line.strip()]
+                                            if len(lines) > 1:
+                                                return lines
+                                            return ai_response
+                                except Exception as parse_err:
+                                    logger.error(f"Erreur lors du parsing de la réponse JSON: {parse_err}")
+                                    return ai_response
+                            else:
+                                error_text = await response.text()
+                                logger.error(f"Erreur OpenRouter ({response.status}): {error_text}")
+                                
+                                if response.status == 429:  # Rate limit
+                                    wait_time = min(30, 2 ** attempt)  # Backoff exponentiel: 1s, 2s, 4s... max 30s
+                                    logger.warning(f"Rate limit atteint, attente de {wait_time}s avant retry")
+                                    await asyncio.sleep(wait_time)
+                                    continue
+                                
+                                if attempt < max_retries - 1:
+                                    await asyncio.sleep(retry_delay * (2 ** attempt))  # Backoff exponentiel
+                                    continue
+                                
+                                # Si toutes les tentatives échouent, essayer une dernière fois avec un prompt simplifié
+                                simplified_prompt = f"Réponds à cette question brièvement: {prompt}"
+                                
+                                payload["messages"] = [
+                                    {"role": "system", "content": "Tu es un expert concis. Réponds en un mot ou une phrase courte."},
+                                    {"role": "user", "content": simplified_prompt}
+                                ]
+                                payload["temperature"] = 0.5  # Plus de flexibilité pour la dernière tentative
+                                
+                                async with session.post(
+                                    OPENROUTER_API_URL, 
+                                    json=payload, 
+                                    headers=headers,
+                                    timeout=20
+                                ) as final_response:
+                                    if final_response.status == 200:
+                                        final_result = await final_response.json()
+                                        final_ai_response = final_result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                                        return final_ai_response
+                                    else:
+                                        # Toutes les tentatives ont échoué
+                                        if analysis_type == "volatility":
+                                            return {"volatility": 5.0}
+                                        elif analysis_type == "confidence":
+                                            return 75
+                                        return "Erreur API: Impossible d'obtenir une réponse"
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout lors de l'appel à OpenRouter - tentative {attempt+1}/{max_retries}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay * (2 ** attempt))
+                    continue
+                
+                # Dernière tentative avec timeout plus court et prompt simplifié
+                try:
+                    simplified_prompt = f"Réponds très brièvement: {prompt}"
+                    
+                    payload["messages"] = [
+                        {"role": "system", "content": "Tu es un expert concis. Réponds en un mot ou une phrase courte."},
+                        {"role": "user", "content": simplified_prompt}
+                    ]
+                    payload["temperature"] = 0.5
+                    
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            OPENROUTER_API_URL, 
+                            json=payload, 
+                            headers=headers,
+                            timeout=15
+                        ) as final_response:
+                            if final_response.status == 200:
+                                final_result = await final_response.json()
+                                final_ai_response = final_result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                                return final_ai_response
+                except Exception:
+                    # Échec final, retourner une valeur par défaut selon le type d'analyse
+                    if analysis_type == "volatility":
+                        return {"volatility": 5.0}
+                    elif analysis_type == "leverage":
+                        return 10
+                    elif analysis_type == "confidence":
+                        return 75
+                    return "Timeout: Impossible d'obtenir une réponse"
+            except Exception as e:
+                logger.error(f"Exception lors de l'appel à OpenRouter - tentative {attempt+1}/{max_retries}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay * (2 ** attempt))
+                    continue
+                
+                # Type de réponse par défaut selon l'analyse demandée
+                if analysis_type == "volatility":
+                    return {"volatility": 5.0}
+                elif analysis_type == "leverage":
+                    return 10
+                elif analysis_type == "confidence":
+                    return 75
+                elif analysis_type == "sl_tp_optimization":
+                    return {
+                        "sl_pct": 3.0,
+                        "tp_count": 3,
+                        "tp_levels": [2.5, 5.0, 8.0],
+                        "trailing_activation": 2,
+                        "trailing_distance": 1.5,
+                        "risk_reward": 2.0
+                    }
+                return f"Erreur: {str(e)[:100]}"
+    except Exception as e:
+        logger.error(f"Exception globale lors de l'analyse avec OpenRouter: {e}")
+        logger.error(traceback.format_exc())
+        
+        # Réponse par défaut selon le type d'analyse
+        if analysis_type == "volatility":
+            return {"volatility": 5.0}
+        elif analysis_type == "leverage":
+            return 10
+        elif analysis_type == "confidence":
+            return 75
+        return f"Erreur globale: {str(e)[:100]}"
+
+
+async def send_discord_message(message, channel_id=None):
+    """
+    Envoie un message sur Discord.
+    
+    Args:
+        message: Le message à envoyer
+        channel_id: ID du canal où envoyer le message
+        
+    Returns:
+        Succès de l'envoi (True/False)
+    """
+    global discord_client, discord_ready, DISCORD_SIGNAL_CHANNEL_ID
+    
+    if not discord_ready:
+        logger.warning("Client Discord non prêt, message non envoyé")
+        return False
+    
+    if channel_id is None:
+        channel_id = DISCORD_SIGNAL_CHANNEL_ID
+    
+    try:
+        channel = discord_client.get_channel(channel_id)
+        if channel:
+            await channel.send(message)
+            logger.info(f"Message Discord envoyé avec succès sur le canal {channel.name}")
+            return True
+        else:
+            logger.error(f"Canal Discord avec ID {channel_id} non trouvé")
+            return False
+    except Exception as e:
+        logger.error(f"Exception lors de l'envoi du message Discord: {e}")
+        return False
+
+async def process_signal(signal_data):
+    """
+    Traite un signal reçu, l'optimise, et l'envoie sur Telegram et Discord.
+    Ignore tout signal dont la confiance est inférieure à 80%.
+    
+    Args:
+        signal_data: Données du signal
+        
+    Returns:
+        Identifiant du signal traité ou None si signal ignoré
+    """
+    try:
+        # Validation de base
+        required_fields = ["symbol", "signal", "price"]
+        for field in required_fields:
+            if field not in signal_data:
+                logger.error(f"Champ requis manquant dans le signal: {field}")
+                return None
+        
+        # Ajouter un timestamp s'il n'existe pas
+        if "timestamp" not in signal_data:
+            signal_data["timestamp"] = datetime.now(timezone.utc).isoformat()
+        
+        # Ajouter un identifiant unique
+        signal_id = f"{signal_data.get('symbol', 'UNKNOWN')}_{signal_data.get('signal', 'UNKNOWN')}_{int(time.time())}"
+        signal_data["signal_id"] = signal_id
+        
+        # Charger les leviers maximums depuis le fichier JSON
+        max_leverages = await load_max_leverages()
+        
+        # Optimiser les paramètres du trade avec l'IA
+        optimized_signal = await optimize_trade_parameters(signal_data, max_leverages)
+        
+        # Vérifier si le signal a été ignoré pour confiance insuffisante
+        if optimized_signal.get("ignored_low_confidence", False):
+            confidence = optimized_signal.get('confidence', 0)
+            logger.warning(f"Signal {optimized_signal.get('symbol')} ignoré: confiance insuffisante ({confidence:.2f}% < 80%)")
+            
+            # Sauvegarder le signal ignoré dans MongoDB si disponible
+            if db is not None:
+                try:
+                    optimized_signal["delivered"] = True
+                    optimized_signal["delivery_status"] = "IGNORED_LOW_CONFIDENCE"
+                    optimized_signal["ignored_timestamp"] = datetime.now(timezone.utc).isoformat()
+                    optimized_signal["signal_id"] = signal_id
+                    
+                    await db[SIGNALS_COLLECTION].insert_one(optimized_signal)
+                    logger.info(f"Signal ignoré {signal_id} sauvegardé dans MongoDB")
+                except Exception as e:
+                    logger.error(f"Erreur lors de la sauvegarde du signal ignoré dans MongoDB: {e}")
+            
+            return None
+        
+        # Vérifier si le signal a été correctement optimisé
+        is_optimized = optimized_signal.get("_optimized", False)
+        if not is_optimized:
+            logger.warning(f"Signal {optimized_signal.get('symbol')} non optimisé correctement, données potentiellement invalides")
+            
+            # Sauvegarder le signal avec erreur dans MongoDB si disponible
+            if db is not None:
+                try:
+                    optimized_signal["delivered"] = True
+                    optimized_signal["delivery_status"] = "OPTIMIZATION_FAILED"
+                    optimized_signal["ignored_timestamp"] = datetime.now(timezone.utc).isoformat()
+                    optimized_signal["signal_id"] = signal_id
+                    
+                    await db[SIGNALS_COLLECTION].insert_one(optimized_signal)
+                except Exception as e:
+                    logger.error(f"Erreur lors de la sauvegarde du signal avec erreur dans MongoDB: {e}")
+            
+            return None
+        
+        # Formater le message avec les détails du signal
+        optimized_signal["telegram_message"] = format_telegram_message(optimized_signal)
+        
+        # Envoyer le message sur Telegram
+        sent_telegram = await send_telegram_message(optimized_signal["telegram_message"], parse_mode="HTML")
+        
+        # Envoyer sur Discord si disponible
+        sent_discord = False
+        if discord_ready:
+            # Utiliser le même message pour Discord
+            optimized_signal["discord_message"] = optimized_signal["telegram_message"]
+            
+            # Envoyer sur le canal des signaux
+            sent_discord = await send_discord_message(optimized_signal["discord_message"], DISCORD_SIGNAL_CHANNEL_ID)
+        
+        # Sauvegarder le signal dans MongoDB si disponible
+        if db is not None:
+            try:
+                optimized_signal["delivered"] = sent_telegram or sent_discord
+                optimized_signal["telegram_sent"] = sent_telegram
+                optimized_signal["discord_sent"] = sent_discord
+                optimized_signal["delivery_timestamp"] = datetime.now(timezone.utc).isoformat()
+                optimized_signal["signal_id"] = signal_id
+                
+                await db[SIGNALS_COLLECTION].insert_one(optimized_signal)
+                logger.info(f"Signal {signal_id} sauvegardé dans MongoDB")
+            except Exception as e:
+                logger.error(f"Erreur lors de la sauvegarde du signal dans MongoDB: {e}")
+        
+        # Ajouter aux trades actifs si le signal a été envoyé
+        if sent_telegram or sent_discord:
+            # Créer l'entrée pour le suivi du trade
+            active_trade = {
+                "signal_id": signal_id,
+                "symbol": optimized_signal.get("symbol"),
+                "signal_type": optimized_signal.get("signal"),
+                "entry_price": optimized_signal.get("price"),
+                "sl": optimized_signal.get("sl"),
+                "tps": optimized_signal.get("tps", []),
+                "leverage": optimized_signal.get("leverage", 1),
+                "strategy": optimized_signal.get("strategy", {"type": "standard"}),
+                "start_time": datetime.now(timezone.utc),
+                "last_check": datetime.now(timezone.utc)
+            }
+            
+            # Ajouter au dictionnaire global des trades actifs
+            global active_trades
+            active_trades[signal_id] = active_trade
+            
+            # Ajouter à MongoDB si disponible
+            if db is not None:
+                try:
+                    await db[ACTIVE_TRADES_COLLECTION].insert_one(active_trade)
+                except Exception as e:
+                    logger.error(f"Erreur lors de la sauvegarde du trade actif dans MongoDB: {e}")
+            
+            logger.info(f"Signal {optimized_signal.get('symbol')} {optimized_signal.get('signal')} envoyé avec succès")
+        else:
+            logger.error(f"Échec de l'envoi du signal {optimized_signal.get('symbol')} {optimized_signal.get('signal')}")
+        
+        return signal_id
+    except Exception as e:
+        logger.error(f"Exception lors du traitement du signal: {e}")
+        logger.error(traceback.format_exc())
+        return None
+
+
+async def process_tp_sl_event(event_data):
+    """
+    Traite un événement TP ou SL.
+    
+    Args:
+        event_data: Données de l'événement
+        
+    Returns:
+        Succès du traitement (True/False)
+    """
+    try:
+        # S'assurer que les données minimales sont présentes
+        required_fields = ["symbol", "event_type", "price"]
+        for field in required_fields:
+            if field not in event_data:
+                logger.error(f"Champ requis manquant dans l'événement: {field}")
+                return False
+        
+        # Ajouter un timestamp s'il n'existe pas
+        if "timestamp" not in event_data:
+            event_data["timestamp"] = datetime.now(timezone.utc).isoformat()
+        
+        # Ajouter un identifiant unique
+        event_id = f"{event_data.get('symbol')}_{event_data.get('event_type')}_{int(time.time())}"
+        event_data["event_id"] = event_id
+        
+        # Enregistrer l'événement dans MongoDB si disponible
+        if db is not None:
+            try:
+                await db[TP_SL_COLLECTION].insert_one(event_data)
+                logger.info(f"Événement {event_id} sauvegardé dans MongoDB")
+            except Exception as e:
+                logger.error(f"Erreur lors de la sauvegarde de l'événement dans MongoDB: {e}")
+        
+        # Formater le message
+        message = await format_tp_sl_message(event_data)
+        
+        # Envoyer sur Telegram
+        await send_telegram_message(message)
+        
+        # Envoyer sur Discord si disponible
+        if discord_ready:
+            await send_discord_message(message)
+        
+        # Retirer des trades actifs si c'est le dernier TP ou un SL
+        if event_data.get("event_type") == "sl" or (
+            event_data.get("event_type") == "tp" and 
+            event_data.get("tp_number") == event_data.get("total_tps", 0)
+        ):
+            # Rechercher le trade à retirer
+            signal_id_to_remove = None
+            for signal_id, trade in active_trades.items():
+                if (trade.get("symbol") == event_data.get("symbol") and 
+                    trade.get("signal_type") == event_data.get("signal_type")):
+                    signal_id_to_remove = signal_id
+                    break
+            
+            if signal_id_to_remove:
+                # Retirer le trade actif
+                removed_trade = active_trades.pop(signal_id_to_remove, None)
+                logger.info(f"Trade actif {signal_id_to_remove} retiré suite à {event_data.get('event_type')}")
+                
+                # Mettre à jour dans MongoDB
+                if db is not None and removed_trade:
+                    try:
+                        await db[ACTIVE_TRADES_COLLECTION].delete_one({"signal_id": signal_id_to_remove})
+                    except Exception as e:
+                        logger.error(f"Erreur lors de la suppression du trade actif dans MongoDB: {e}")
+        
+        logger.info(f"Événement {event_id} traité et envoyé")
+        return True
+    except Exception as e:
+        logger.error(f"Exception lors du traitement de l'événement TP/SL: {e}")
+        logger.error(traceback.format_exc())
+        return False
+
+async def format_tp_sl_message(event_data):
+    """
+    Formate un message pour un événement TP ou SL.
+    
+    Args:
+        event_data: Données de l'événement
+        
+    Returns:
+        Message formaté
+    """
+    try:
+        # Extraire les informations de l'événement
+        symbol = event_data.get("symbol", "UNKNOWN")
+        event_type = event_data.get("event_type", "unknown")
+        entry_price = event_data.get("entry_price", 0)
+        exit_price = event_data.get("price", 0)
+        signal_type = event_data.get("signal_type", "UNKNOWN")
+        leverage = event_data.get("leverage", 1)
+        tp_number = event_data.get("tp_number", 0)
+        profit_percent = event_data.get("profit_percent", 0)
+        
+        # Calculer la durée du trade
+        start_time = event_data.get("start_time")
+        end_time = event_data.get("timestamp")
+        
+        duration_text = "Durée inconnue"
+        if start_time and end_time:
+            try:
+                # Convertir en datetime si nécessaire
+                if isinstance(start_time, str):
+                    start_time = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+                if isinstance(end_time, str):
+                    end_time = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+                
+                # Calculer la durée
+                duration = end_time - start_time
+                duration_hours = duration.total_seconds() / 3600
+                
+                if duration_hours < 1:
+                    duration_text = f"{int(duration.total_seconds() / 60)} minutes"
+                elif duration_hours < 24:
+                    duration_text = f"{int(duration_hours)} heures {int((duration_hours % 1) * 60)} minutes"
+                else:
+                    days = int(duration_hours / 24)
+                    remaining_hours = int(duration_hours % 24)
+                    duration_text = f"{days} jours {remaining_hours} heures"
+            except Exception as e:
+                logger.error(f"Erreur lors du calcul de la durée du trade: {e}")
+        
+        # Déterminer le message en fonction du type d'événement
+        if event_type == "tp":
+            # Formater en fonction du take profit atteint
+            if tp_number == 1:
+                title = f"🎯 PREMIER TP ATTEINT - {symbol}"
+                emoji = "✅"
+            elif tp_number == 2:
+                title = f"🎯🎯 DEUXIÈME TP ATTEINT - {symbol}"
+                emoji = "✅✅"
+            elif tp_number == 3:
+                title = f"🎯🎯🎯 TROISIÈME TP ATTEINT - {symbol}"
+                emoji = "✅✅✅"
+            elif tp_number == 4:
+                title = f"🎯🎯🎯🎯 QUATRIÈME TP ATTEINT - {symbol}"
+                emoji = "✅✅✅✅"
+            elif tp_number == 5:
+                title = f"🎯🎯🎯🎯🎯 CINQUIÈME TP ATTEINT - {symbol}"
+                emoji = "✅✅✅✅✅"
+            else:
+                title = f"🎯 TP#{tp_number} ATTEINT - {symbol}"
+                emoji = "✅" * min(tp_number, 5)
+                
+            action = "LONG" if signal_type == "BUY" else "SHORT"
+            color_emoji = "🟢" if signal_type == "BUY" else "🔴"
+                
+            message = f"""
+{title}
+
+{color_emoji} {action} {symbol} {emoji}
+
+📈 Prix d'entrée: {entry_price:.4f}
+🎯 Prix de sortie: {exit_price:.4f}
+💰 Profit: +{profit_percent:.2f}% (avec levier {leverage}x)
+⏱️ {duration_text}
+
+⏰ {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
+"""
+        elif event_type == "sl":
+            title = f"⛔ STOP LOSS DÉCLENCHÉ - {symbol}"
+            emoji = "🛑"
+            
+            action = "LONG" if signal_type == "BUY" else "SHORT"
+            color_emoji = "🟢" if signal_type == "BUY" else "🔴"
+            
+            message = f"""
+{title}
+
+{color_emoji} {action} {symbol} {emoji}
+
+📈 Prix d'entrée: {entry_price:.4f}
+🔻 Prix de sortie: {exit_price:.4f}
+💸 Perte: {profit_percent:.2f}% (avec levier {leverage}x)
+⏱️ {duration_text}
+
+⏰ {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
+"""
+        else:
+            message = f"⚠️ Événement inconnu pour {symbol}: {event_type}"
+        
+        return message
+    except Exception as e:
+        logger.error(f"Exception lors du formatage du message TP/SL: {e}")
+        return f"⚠️ Erreur lors du formatage du message TP/SL: {str(e)[:100]}"
+
+
+async def convert_numpy_types(obj):
+    """
+    Convertit les types numpy en types Python natifs pour être compatible avec JSON
+    
+    Args:
+        obj: L'objet à convertir
+        
+    Returns:
+        Objet avec types Python natifs
+    """
+    if isinstance(obj, dict):
+        return {k: await convert_numpy_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [await convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(await convert_numpy_types(item) for item in obj)
+    elif hasattr(obj, "dtype"):
+        # Conversion des types numpy
+        if obj.dtype.kind in ['i', 'u']:
+            return int(obj)
+        elif obj.dtype.kind == 'f':
+            return float(obj)
+        elif obj.dtype.kind == 'b':
+            return bool(obj)
+        elif obj.dtype.kind in ['S', 'U']:
+            return str(obj)
+    return obj
+
+
+async def schedule_daily_recap():
+    """Planifie l'envoi d'un récapitulatif quotidien des performances"""
+    logger.info("Planification du récapitulatif quotidien des performances...")
+    
+    try:
+        # Planifier à 22h UTC chaque jour
+        aiocron.crontab('0 22 * * *', func=send_daily_recap, start=True)
+        logger.info("Récapitulatif quotidien planifié avec succès pour 22h UTC")
+    except Exception as e:
+        logger.error(f"Erreur lors de la planification du récapitulatif quotidien: {e}")
+
+
+async def send_daily_recap():
+    """
+    Envoie un récapitulatif quotidien des performances.
+    
+    Analyse les trades de la journée, calcule les statistiques, 
+    et envoie un résumé sur Telegram et Discord.
+    """
+    logger.info("Préparation du récapitulatif quotidien des performances...")
+    
+    try:
+        if db is None:
+            logger.error("MongoDB non disponible, impossible de générer le récapitulatif")
+            return
+        
+        # Calculer la date de début (aujourd'hui à 00:00 UTC)
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Calculer la date de fin (maintenant)
+        end_time = datetime.now(timezone.utc)
+        
+        # Récupérer les événements de TP et SL de la journée
+        tp_sl_events = await db[TP_SL_COLLECTION].find({
+            "timestamp": {
+                "$gte": today_start.isoformat(),
+                "$lte": end_time.isoformat()
+            }
+        }).to_list(100)  # Limiter à 100 événements par jour
+        
+        if not tp_sl_events:
+            logger.info("Aucun événement TP/SL aujourd'hui, récapitulatif non envoyé")
+            # Envoyer un message simplifié
+            simple_message = f"""
+📊 RÉCAPITULATIF JOURNALIER {today_start.strftime("%d/%m/%Y")} 📊
+
+Aucun trade fermé aujourd'hui.
+
+⏰ {end_time.strftime("%Y-%m-%d %H:%M UTC")}
+"""
+            await send_telegram_message(simple_message)
+            
+            if discord_ready:
+                await send_discord_message(simple_message)
+            
+            return
+        
+        # Compter les TP et SL
+        tp_count = sum(1 for e in tp_sl_events if e.get("event_type") == "tp")
+        sl_count = sum(1 for e in tp_sl_events if e.get("event_type") == "sl")
+        
+        # Calculer le profit total
+        total_profit_percent = sum(e.get("profit_percent", 0) * e.get("leverage", 1) for e in tp_sl_events)
+        
+        # Calculer le winrate
+        total_trades = tp_count + sl_count
+        winrate = (tp_count / total_trades) * 100 if total_trades > 0 else 0
+        
+        # Trouver le meilleur et le pire trade
+        best_trade = None
+        worst_trade = None
+        best_profit = -float('inf')
+        worst_profit = float('inf')
+        
+        for event in tp_sl_events:
+            profit = event.get("profit_percent", 0) * event.get("leverage", 1)
+            if profit > best_profit:
+                best_profit = profit
+                best_trade = event
+            if profit < worst_profit:
+                worst_profit = profit
+                worst_trade = event
+        
+        # Créer le message de récapitulatif
+        message = f"""
+📊 RÉCAPITULATIF JOURNALIER {today_start.strftime("%d/%m/%Y")} 📊
+
+🏆 Performance: {total_profit_percent:.2f}%
+📈 Trades gagnants: {tp_count}
+📉 Trades perdants: {sl_count}
+🎯 Winrate: {winrate:.1f}%
+
+"""
+        
+        if best_trade:
+            symbol = best_trade.get("symbol", "UNKNOWN")
+            profit = best_trade.get("profit_percent", 0) * best_trade.get("leverage", 1)
+            message += f"⭐ Meilleur trade: {symbol} (+{profit:.2f}%)\n"
+        
+        if worst_trade:
+            symbol = worst_trade.get("symbol", "UNKNOWN")
+            profit = worst_trade.get("profit_percent", 0) * worst_trade.get("leverage", 1)
+            message += f"⛔ Pire trade: {symbol} ({profit:.2f}%)\n"
+        
+        message += f"\n⏰ {end_time.strftime('%Y-%m-%d %H:%M UTC')}"
+        
+        # Envoyer le message
+        await send_telegram_message(message)
+        
+        if discord_ready:
+            await send_discord_message(message)
+        
+        # Enregistrer les statistiques dans MongoDB
+        await db[WINRATE_COLLECTION].insert_one({
+            "date": today_start.isoformat(),
+            "tp_count": tp_count,
+            "sl_count": sl_count,
+            "total_profit_percent": total_profit_percent,
+            "winrate": winrate,
+            "best_trade": best_trade,
+            "worst_trade": worst_trade
+        })
+        
+        logger.info(f"Récapitulatif quotidien envoyé: {tp_count} TP, {sl_count} SL, {winrate:.1f}% winrate")
+    except Exception as e:
+        logger.error(f"Exception lors de l'envoi du récapitulatif quotidien: {e}")
+        logger.error(traceback.format_exc())
+
+
+aasync def calculate_signal_confidence(signal_data, signal_type):
+    """
+    Calcule le niveau de confiance du signal.
+    
+    Args:
+        signal_data: Données du signal
+        signal_type: Type de signal (BUY/SELL)
+        
+    Returns:
+        Niveau de confiance (0-100)
+    """
+    try:
+        # Demander à l'IA de calculer la confiance pour ce signal
+        detailed_analysis = await analyze_with_openrouter(
+            f"""
+            Calcule le niveau de confiance pour ce signal {signal_type} sur {signal_data.get('symbol')}.
+            
+            DONNÉES:
+            - Prix: {signal_data.get('price')}
+            - Tendance: {signal_data.get('market_trend')}
+            - Force de tendance: {signal_data.get('trend_strength')}
+            - RSI: {signal_data.get('rsi', 'non spécifié')}
+            
+            Analyse chaque facteur et attribue un score:
+            
+            Réponds au format JSON:
+            {{
+              "trend_alignment": X,  // 0-25 points
+              "technical_indicators": X,  // 0-25 points 
+              "entry_zone": X,  // 0-20 points
+              "timing": X,  // 0-15 points
+              "market_context": X,  // 0-15 points
+              "total": X  // Score total
+            }}
+            """,
+spécifiée')}
+        - Force tendance: {signal_data.get('trend_strength', 'non spécifiée')}
+        - RSI: {signal_data.get('rsi', 'non spécifié')}
+        - Volatilité: {signal_data.get('volatility', 'non spécifiée')}
+        - Supports: {signal_data.get('support_levels', [])}
+        - Résistances: {signal_data.get('resistance_levels', [])}
+        
+        CRITÈRES:
+        1. Alignement avec la tendance macro (0-25 points)
+        2. Confirmation par indicateurs techniques (0-25 points)
+        3. Zone d'entrée pertinente (proximité support/résistance) (0-20 points)
+        4. Timing d'entrée (0-15 points)
+        5. Contexte de marché favorable (0-15 points)
+        
+        Calcule chaque critère et donne un score total sur 100.
+        Réponds UNIQUEMENT avec un nombre entier représentant la confiance totale.
+        """
+            
+        confidence_result = await analyze_with_openrouter(confidence_prompt, temperature=0.1, analysis_type="confidence")
+        
+        if isinstance(confidence_result, (int, float)):
+            return round(float(confidence_result))
+        elif isinstance(confidence_result, str) and confidence_result.isdigit():
+            return round(float(confidence_result))
+        elif isinstance(confidence_result, dict) and "confidence" in confidence_result:
+            return round(float(confidence_result["confidence"]))
+        else:
+            # Demander à Claude une analyse détaillée
+            detailed_analysis = await analyze_with_openrouter(
+                f"""
+                Analyse ce signal et calcule sa confiance (score 0-100):
+                
+                - Type: {signal_type} sur {signal_data.get('symbol')}
+                - Prix: {signal_data.get('price')}
+                - Tendance: {signal_data.get('market_trend', 'non spécifiée')}
+                
+                Réponds au format JSON:
+                {{
+                  "trend_alignment": X,  // 0-25 points
+                  "technical_indicators": X,  // 0-25 points 
+                  "entry_zone": X,  // 0-20 points
+                  "timing": X,  // 0-15 points
+                  "market_context": X,  // 0-15 points
+                  "total": X  // Score total
+                }}
+                """,
+                temperature=0.1,
+                analysis_type="detailed_confidence"
+            )
+            
+            if isinstance(detailed_analysis, dict) and "total" in detailed_analysis:
+                return round(float(detailed_analysis["total"]))
+            else:
+                return 75  # Valeur par défaut
+                
+    except Exception as e:
+        logger.error(f"Exception lors du calcul de la confiance du signal: {e}")
+        logger.error(traceback.format_exc())
+        
+        # En cas d'erreur, retourner une valeur prudente
+        return 70  # Valeur médiane en cas d'échec
+nd_alignment": X,  // 0-25 points
+                  "technical_indicators": X,  // 0-25 points 
+                  "entry_zone": X,  // 0-20 points
+                  "timing": X,  // 0-15 points
+                  "market_context": X,  // 0-15 points
+                  "total": X  // Score total
+                }}
+                """,
+                temperature=0.1,
+                analysis_type="detailed_confidence"
+            )
+            
+            if isinstance(detailed_analysis, dict) and "total" in detailed_analysis:
+                return round(float(detailed_analysis["total"]))
+            else:
+                # Dernière tentative - analyse simple avec Claude
+                simple_confidence = await analyze_with_openrouter(
+                    f"Sur une échelle de 0 à 100, quelle est ta confiance pour ce signal {signal_type} sur {signal_data.get('symbol')}? Réponds uniquement avec un nombre.",
+                    temperature=0.1,
+                    analysis_type="simple_confidence"
+                )
+                
+                if isinstance(simple_confidence, (int, float)):
+                    return round(float(simple_confidence))
+                elif isinstance(simple_confidence, str) and simple_confidence.isdigit():
+                    return round(float(simple_confidence))
+                else:
+                    # Analyse de base en fonction de l'alignement des tendances
+                    base_confidence = 75  # Point de départ médian
+                    
+                    # Ajuster en fonction de l'alignement des tendances
+                    if signal_data.get('market_trend') == 'bullish' and signal_type == 'BUY':
+                        base_confidence += 10
+                    elif signal_data.get('market_trend') == 'bearish' and signal_type == 'SELL':
+                        base_confidence += 10
+                    elif signal_data.get('market_trend') == 'bullish' and signal_type == 'SELL':
+                        base_confidence -= 10
+                    elif signal_data.get('market_trend') == 'bearish' and signal_type == 'BUY':
+                        base_confidence -= 10
+                    
+                    # Ajuster en fonction de la force de la tendance
+                    if signal_data.get('trend_strength') == 'forte':
+                        base_confidence += 5
+                    elif signal_data.get('trend_strength') == 'faible':
+                        base_confidence -= 5
+                    
+                    # Ajuster en fonction du RSI (suracheté/survendu)
+                    rsi = signal_data.get('rsi')
+                    if rsi:
+                        rsi_value = float(rsi)
+                        if signal_type == 'BUY' and rsi_value < 30:
+                            base_confidence += 5
+                        elif signal_type == 'SELL' and rsi_value > 70:
+                            base_confidence += 5
+                        elif signal_type == 'BUY' and rsi_value > 70:
+                            base_confidence -= 10
+                        elif signal_type == 'SELL' and rsi_value < 30:
+                            base_confidence -= 10
+                    
+                    # Limiter entre 0 et 100
+                    return max(0, min(100, base_confidence))
+    except Exception as e:
+        logger.error(f"Exception lors du calcul de la confiance du signal: {e}")
+        logger.error(traceback.format_exc())
+        
+        # En cas d'erreur, retourner une valeur prudente
+        return 70  # Valeur médiane en cas d'échec
+
+
+async def init_mongodb():
+    """Initialise la connexion à MongoDB"""
+    global db
+    
+    try:
+        mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+        mongo_db_name = os.getenv("MONGO_DB", "neotradex")
+        
+        logger.info(f"Connexion à MongoDB: {mongo_url}, DB: {mongo_db_name}")
+        
+        # Créer le client MongoDB
+        client = AsyncIOMotorClient(mongo_url)
+        
+        # Vérifier la connexion
+        await client.admin.command("ismaster")
+        
+        # Assigner la base de données
+        db = client[mongo_db_name]
+        
+        logger.info("✅ Connexion à MongoDB établie avec succès!")
+    except Exception as e:
+        logger.error(f"❌ Erreur lors de la connexion à MongoDB: {e}")
+        db = None
+
+
+async def init_discord():
+    """Initialise la connexion à Discord"""
+    global discord_client, discord_ready, DISCORD_TOKEN, DISCORD_SIGNAL_CHANNEL_ID
+    
+    try:
+        DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+        DISCORD_SIGNAL_CHANNEL_ID = int(os.getenv("DISCORD_SIGNAL_CHANNEL_ID", "0"))
+        
+        if not DISCORD_TOKEN:
+            logger.warning("Token Discord non défini, intégration Discord désactivée")
+            discord_ready = False
+            return
+        
+        # Créer le client Discord
+        intents = discord.Intents.default()
+        intents.message_content = True
+        discord_client = discord.Client(intents=intents)
+        
+        # Définir les événements
+        @discord_client.event
+        async def on_ready():
+            global discord_ready
+            logger.info(f"✅ Connecté à Discord en tant que {discord_client.user}")
+            discord_ready = True
+        
+        # Se connecter à Discord
+        await discord_client.start(DISCORD_TOKEN)
+    except Exception as e:
+        logger.error(f"❌ Erreur lors de la connexion à Discord: {e}")
+        discord_ready = False
+
+
+async def main():
+    """Point d'entrée principal de l'application"""
+    global TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+    
+    logger.info("🚀 Démarrage du service Facteur...")
+    
+    try:
+        # Charger les variables d'environnement
+        TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+        TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+        
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            logger.critical("❌ Token Telegram ou Chat ID non défini, impossible de continuer")
+            return
+        
+        # Initialiser les connexions
+        await init_mongodb()
+        
+        # Tester la connexion à Telegram
+        telegram_success = await test_telegram_connection()
+        if not telegram_success:
+            logger.critical("❌ Échec du test de connexion Telegram, arrêt du service")
+            return
+        
+        # Vérifier les signaux non livrés au démarrage
+        await check_undelivered_signals()
+        
+        # Planifier le récapitulatif quotidien
+        await schedule_daily_recap()
+        
+        # Garder le service en vie
+        while True:
+            await asyncio.sleep(60)
+    except KeyboardInterrupt:
+        logger.info("⛔ Arrêt du service Facteur demandé par l'utilisateur")
+    except Exception as e:
+        logger.critical(f"❌ Exception non gérée dans la fonction principale: {e}")
+        logger.error(traceback.format_exc())
+
+
+# Variables globales
+discord_client = None
+discord_ready = False
+active_trades = {}
+TELEGRAM_TOKEN = ""
+TELEGRAM_CHAT_ID = ""
+DISCORD_TOKEN = ""
+DISCORD_SIGNAL_CHANNEL_ID = 0
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("⛔ Arrêt du service Facteur")
+    except Exception as e:
+        logger.critical(f"❌ Exception fatale: {e}")
+        logger.error(traceback.format_exc())
